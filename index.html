@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>就活カレンダー</title>
+<meta name="description" content="Gmail の選考メールから、締切と面接の予定をまとめるカレンダー">
+<meta name="theme-color" content="#1a73e8">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="就活カレンダー">
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --text: #1f2328; --muted: #6b7280; --line: #e5e7eb; --accent: #1a73e8; --red: #d93025; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171a; --card: #1f2226; --text: #e8eaed; --muted: #9aa0a6; --line: #33373c; --accent: #8ab4f8; --red: #f28b82; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic UI", sans-serif; }
+  #app { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: var(--bg); }
+  #app[hidden], .welcome[hidden], .menu[hidden], [hidden] { display: none !important; }
+  .welcome { max-width: 520px; margin: 0 auto; padding: 48px 16px; line-height: 1.7; }
+  .welcome h1 { font-size: 24px; margin: 0 0 8px; }
+  .welcome p { color: var(--muted); margin: 0 0 16px; }
+  .welcome ul { padding-left: 20px; margin: 0 0 24px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 8px; padding: 8px 16px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: bold; padding: 12px 20px; }
+  button:disabled { opacity: .6; cursor: wait; }
+  .error { color: var(--red); margin-top: 12px; white-space: pre-wrap; }
+  .note { font-size: 13px; color: var(--muted); }
+  .warn { background: #fef3c7; color: #92400e; padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 16px; }
+  .menu { position: fixed; inset: 0; background: rgba(0, 0, 0, .35); display: flex; align-items: center; justify-content: center; z-index: 10; padding: 16px; }
+  .menu .box { background: var(--card); border-radius: 12px; padding: 18px; width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 10px; }
+  .menu a { color: var(--accent); }
+  /* はじめの設定 */
+  .setup-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 12px; margin: 8px 0 20px; padding: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .setup-list label { display: flex; align-items: center; gap: 6px; font-size: 14px; min-width: 0; }
+  .setup-list small { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button.link { border: 0; background: none; padding: 0; color: var(--accent); text-decoration: underline; }
+  /* 裏で読んでいるときの帯（画面の下のまん中） */
+  .progress { position: fixed; left: 50%; bottom: 72px; transform: translateX(-50%); z-index: 15; display: flex; align-items: center; gap: 8px; max-width: calc(100% - 32px);
+    padding: 8px 14px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 13px; box-shadow: 0 4px 16px rgba(0, 0, 0, .25); }
+  .progress.done { background: #188038; }
+  .progress.done .spin { display: none; }
+  .spin { flex: none; width: 14px; height: 14px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  /* 使い方の説明：まわりを暗くして、説明する場所だけ明るく。吹き出しで説明 */
+  .tour { position: fixed; inset: 0; z-index: 20; pointer-events: none; }
+  .tour .shade { position: fixed; background: rgba(0, 0, 0, .55); pointer-events: auto; }
+  .tour .ring { position: fixed; border: 3px solid #fbbc04; border-radius: 10px; box-shadow: 0 0 0 4px rgba(251, 188, 4, .35); pointer-events: none; }
+  .tour .bubble { position: fixed; width: min(360px, calc(100% - 16px)); background: var(--card); color: var(--text); border-radius: 12px; padding: 14px 16px; box-shadow: 0 8px 28px rgba(0, 0, 0, .35); pointer-events: auto; }
+  .tour .count { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .tour .text { white-space: pre-wrap; line-height: 1.6; font-size: 14px; }
+  .tour .sample { margin-top: 8px; font-size: 11px; color: var(--muted); }
+  .tour .buttons { display: flex; justify-content: space-between; gap: 8px; margin-top: 12px; }
+  .tour .buttons button { padding: 6px 12px; font-size: 13px; }
+  .tour .buttons .primary { padding: 6px 14px; }
+  button.danger { color: var(--red); border-color: var(--red); }
+</style>
+</head>
+<body>
+<section class="welcome" id="welcome" hidden>
+  <h1>就活カレンダー</h1>
+  <p>Gmail に届いた選考のメールから、ESの締切・面接の予定・結果待ちをまとめて、カレンダーに出します。</p>
+  <ul>
+    <li>メールは、あなたのブラウザが Gmail から直接読みます。どこかのサーバーに送ることはありません。</li>
+    <li>データは、あなたの Googleドライブ の「アプリ専用の場所」に保存します（ドライブの一覧には出ません）。パソコンとスマホで同じものを見られます。</li>
+    <li>見るだけならログインは要りません。「メールから更新」を押したときだけ、Google のログインが出ます。</li>
+  </ul>
+  <div class="warn" id="no-client" hidden>設定がまだです。config.js に Google Cloud の「クライアント ID」を入れてください。</div>
+  <button class="primary" id="start">Googleでログインして始める</button>
+  <p class="note" id="welcome-busy" hidden>準備しています…（初めてのときは、少しかかります）</p>
+  <div class="error" id="welcome-error"></div>
+</section>
+
+<!-- はじめの設定：読まない就活サイト（メールを読み始める前に決める。検索の段階で外すので速い） -->
+<section class="welcome" id="setup" hidden>
+  <h1>はじめの設定</h1>
+  <p>就活サイトからの宣伝メールは、読まないほうが速くて正確です。<b>チェックが入っているサイトのメールは読みません。</b>選考の連絡を就活サイト経由で受け取っているサイトがあれば、チェックを外してください。あとから「設定」で変えられます。</p>
+  <div class="setup-list" id="setup-list"></div>
+  <button class="primary" id="setup-next">次へ（メールを読み始める）</button>
+  <p class="note">次へを押すと、メールを読みながら、アプリの使い方を説明します。</p>
+  <p class="note">前の版（Apps Script 版）を使っていた人：<button class="link" id="setup-import">書き出したファイルを読み込む</button><input type="file" id="setup-file" accept=".json,application/json" hidden> <span id="setup-import-done"></span></p>
+</section>
+
+<iframe id="app" title="就活カレンダー" hidden></iframe>
+
+<!-- 裏でメールを読んでいるときの進み具合 -->
+<div class="progress" id="progress" role="status" aria-live="polite" hidden><span class="spin"></span><span id="progress-text"></span></div>
+
+<div class="menu" id="menu" hidden>
+  <div class="box" role="dialog" aria-label="アカウント">
+    <b>アカウント</b>
+    <div id="menu-email" class="note"></div>
+    <div class="note">データの書き出し・読み込みは、画面の上の「設定」からできます。</div>
+    <div id="menu-timing" class="note" style="white-space: pre-wrap"></div>
+    <button id="menu-tour">使い方をもう一度見る</button>
+    <button id="menu-signout">ログアウト（この端末の保存を消す）</button>
+    <button id="menu-wipe" class="danger">データを全部消す（ドライブの分も）</button>
+    <button id="menu-close">閉じる</button>
+  </div>
+</div>
+
+<script src="https://accounts.google.com/gsi/client" async></script>
+<script src="sheet.js"></script>
+<script src="core.js"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>
