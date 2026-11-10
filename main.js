@@ -260,7 +260,24 @@ async function readAndSave(full, label) {
   INFO.lastTiming = label === '（もっと前のメール）' && /^最近1週間/.test(INFO.lastTiming) ? INFO.lastTiming + '\n' + line : line;
   console.log('[就活カレンダー] 更新にかかった時間', INFO.lastTiming);
   await saveLocal();
+  // 原因を調べるためのログを、マイドライブに上書きで残す（保存できなくても更新は終わっている）
+  try { await G.saveLogFile(logText(s, line)); } catch (e) { console.warn('[就活カレンダー] ログを保存できませんでした', e); }
   return data;
+}
+
+/**
+ * ログ（マイドライブの「就活カレンダー_ログ.txt」）の中身：更新の情報、Gmail で何を検索して何件見つかったか、
+ * メールごとにどう読んで何をしたか（更新の記録）。本文は入れない
+ */
+function logText(s, timing) {
+  const pad = n => String(n).padStart(2, '0');
+  const t = v => { const d = v instanceof Date ? v : new Date(v); return isNaN(d.getTime()) ? '' : d.getFullYear() + '/' + pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  const lines = ['就活カレンダーのログ（' + t(new Date()) + ' の更新）', '', '■ 更新の情報', timing, '', '■ Gmail の検索（言葉 → 見つかったスレッドの数）'];
+  (s.searches || []).forEach(x => lines.push(x.q + ' → ' + x.found + (x.more ? '（まだ先あり）' : '')));
+  lines.push('', '■ メールごとの判断（新しい順）', 'メールの日時 | 会社（メールから） | 件名 | 選考種別 | 結果 | くわしく');
+  const tr = SS.getSheetByName(CONFIG.TRACE_SHEET);
+  if (tr) tr.getDataRange().getValues().slice(1).forEach(r => { if (r[0]) lines.push([t(r[0])].concat(r.slice(1).map(v => String(v))).join(' | ')); });
+  return lines.join('\n');
 }
 
 /**

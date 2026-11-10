@@ -3,10 +3,15 @@
 //   - Gmail：core.js の collectSteps の問い合わせに、Gmail API で答える（runGmailStepsAsync）
 //   - 保存：本人の Googleドライブ の「アプリ専用の場所」（appDataFolder）にファイルを置く。ドライブの一覧には出ず、ほかのファイルも見えない
 
-export const SCOPES = [
+// drive.file：このアプリが作ったファイルだけ（マイドライブの「就活カレンダー_ログ.txt」）。ほかのファイルは見えない。
+// 許可されなくてもアプリは動く（ログを残さないだけ）
+const DRIVE_FILE = 'https://www.googleapis.com/auth/drive.file';
+const REQUIRED = [
   'https://www.googleapis.com/auth/gmail.readonly',
   'https://www.googleapis.com/auth/drive.appdata',
-].join(' ');
+];
+export const SCOPES = REQUIRED.concat([DRIVE_FILE]).join(' ');
+let grantedScopes = [];
 
 const GMAIL = 'https://gmail.googleapis.com/gmail/v1/users/me/';
 const DRIVE = 'https://www.googleapis.com/drive/v3/files';
@@ -31,8 +36,9 @@ export function initAuth(clientId, loginHint) {
       if (resp.error) { w.reject(new Error('ログインできませんでした（' + resp.error + '）')); return; }
       // 「Gmail を読む」などのチェックを外して許可されたとき
       const granted = String(resp.scope || '').split(' ');
-      const missing = SCOPES.split(' ').filter(s => !granted.includes(s));
+      const missing = REQUIRED.filter(s => !granted.includes(s));
       if (missing.length) { w.reject(new Error('Gmail とドライブの両方を許可してください（許可の画面で、チェックを全部入れて「続行」）')); return; }
+      grantedScopes = granted;
       token = resp.access_token;
       expiresAt = Date.now() + (Number(resp.expires_in) || 3600) * 1000;
       w.resolve(token);
@@ -74,7 +80,7 @@ export function _setForTest({ fetch, accessToken, limits, retryMs, simpleMax, ne
   if (simpleMax) SIMPLE_MAX = simpleMax;
   if (netRetryMs) NET_RETRY_MS = netRetryMs;
   if (fetch) fetchImpl = fetch;
-  if (accessToken) { token = accessToken; expiresAt = Date.now() + 3600e3; }
+  if (accessToken) { token = accessToken; expiresAt = Date.now() + 3600e3; grantedScopes = SCOPES.split(' '); }
   PERSIST = false; // テストで覚えた量を、本物のアプリに残さない
   if (limits) { LIMITS = limits.map(l => l.slice()); ADAPTIVE = !!adaptive; lastLimitAt = lastChangeAt = -1e9; }
   if (retryMs) RETRY_MS = retryMs;
@@ -148,7 +154,7 @@ function gmailCost(url) {
 }
 // 前回の読み取りの数字（どこで時間がかかったかを見るため）：開いたスレッド・開かなかったスレッド・新しく読んだメール・
 // 上限で待った時間（同時にいくつ待っていても、時計の上での時間）・上限のエラーの回数と、Gmail が言った理由
-export const stats = { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {} };
+export const stats = { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {}, searches: [] };
 // 問い合わせの種類ごとの回数と、上限のエラーの回数（どれが「重い」かを見るため）：検索（一覧）・スレッドを開く
 const callType = url => (/\/threads\?/.test(url) ? '検索' : /\/threads\//.test(url) ? 'スレッドを開く' : /\/profile/.test(url) ? 'プロフィール' : 'そのほか');
 function count(url, key) {
@@ -241,7 +247,7 @@ export async function getProfileEmail() {
  */
 export async function runGmailStepsAsync(steps, cachedIds, onProgress, known) {
   known = known || {};
-  Object.assign(stats, { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {} });
+  Object.assign(stats, { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {}, searches: [] });
   const pages = new Map();  // 検索の言葉 → 見つかったスレッド（ページをめくって足していく）
   const threads = new Map(); // スレッドの id → { last（いちばん新しいメールの日時）, ids（下書きを除くメールの id。まだ開いていなければ null）, history }
   let read = 0;
@@ -277,6 +283,8 @@ export async function runGmailStepsAsync(steps, cachedIds, onProgress, known) {
     }
     step = steps.next(answer);
   }
+  // 検索の言葉ごとに、見つかったスレッドの数（ログに出す。more はまだ先があったのに読まなかった）
+  stats.searches = [...pages].map(([q, p]) => ({ q, found: p.list.length, more: !p.done }));
   // スレッドの状態を覚える。ただし途中で止まったときは、新しいメールがなかったスレッドだけ
   // （新しいメールを保存しきれなかったスレッドを「変わっていない」と覚えると、次から読まれなくなるため）
   const finished = !(step.value && step.value.stopped);
@@ -392,6 +400,31 @@ export async function uploadText(name, id, text) {
     '--' + boundary + '\r\nContent-Type: application/gzip\r\n\r\n', body, '\r\n--' + boundary + '--',
   ]);
   return api(UPLOAD + '?' + params({ uploadType: 'multipart', fields: 'id,modifiedTime' }), { method: 'POST', body: multipart, headers: { 'Content-Type': 'multipart/related; boundary=' + boundary } });
+}
+
+/**
+ * 更新のログを、マイドライブの「就活カレンダー_ログ.txt」に上書きで保存する（原因を調べるときに読む。ドライブの一覧に見えるファイル）。
+ * 「このアプリが作ったファイル」の許可（drive.file）がなければ何もしない。返り値は保存したか
+ */
+export const LOG_NAME = '就活カレンダー_ログ.txt';
+export async function saveLogFile(text) {
+  if (!grantedScopes.includes(DRIVE_FILE)) return false;
+  const q = "name = '" + LOG_NAME + "' and trashed = false";
+  const r = (await api(DRIVE + '?' + params({ q, spaces: 'drive', fields: 'files(id)', pageSize: 1 }))) || {};
+  const id = ((r.files || [])[0] || {}).id;
+  const body = new Blob([text], { type: 'text/plain' });
+  if (id) {
+    await api(UPLOAD + '/' + id + '?' + params({ uploadType: 'media', fields: 'id' }), { method: 'PATCH', body, headers: { 'Content-Type': 'text/plain; charset=UTF-8' } });
+    return true;
+  }
+  const boundary = 'shukatsu' + Math.random().toString(36).slice(2);
+  const meta = JSON.stringify({ name: LOG_NAME, mimeType: 'text/plain' });
+  const multipart = new Blob([
+    '--' + boundary + '\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n' + meta + '\r\n',
+    '--' + boundary + '\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n', body, '\r\n--' + boundary + '--',
+  ]);
+  await api(UPLOAD + '?' + params({ uploadType: 'multipart', fields: 'id' }), { method: 'POST', body: multipart, headers: { 'Content-Type': 'multipart/related; boundary=' + boundary } });
+  return true;
 }
 
 /** 大きいファイル：まず「これから送る」と伝えて送り先をもらい、そこへ中身を送る */
