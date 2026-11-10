@@ -370,11 +370,42 @@ export const japaneseChars = s => (String(s || '').match(/[぀-ヿ一-鿿]/g) ||
 export function decodePart(p) {
   const ct = (((p.headers || []).find(h => h.name.toLowerCase() === 'content-type') || {}).value) || p.mimeType || '';
   const charset = ((ct.match(/charset="?([^";\s]+)"?/i) || [])[1] || 'utf-8').toLowerCase();
-  const b64 = p.body.data.replace(/-/g, '+').replace(/_/g, '/');
+  const bytes = fromBase64(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+  const text = decodeAs(bytes, charset) || decodeAs(bytes, 'utf-8');
+  if (japaneseChars(text) > 0) return text;
+  // 日本語が1文字もない：文字化けかもしれない（ベイカレントなど）。送るための包み（quoted-printable・base64）がほどけていないものはほどき、
+  // 日本語の文字コードをいくつか試して、日本語がいちばん多く出たものにする（英語のメールは、どれでも0文字なのでそのまま）
+  const raw = new TextDecoder('latin1').decode(bytes);
+  const candidates = [bytes];
+  if (/=[0-9A-F]{2}|=\r?\n/i.test(raw)) candidates.push(fromQuotedPrintable(raw));
+  const compact = raw.replace(/\s+/g, '');
+  if (compact.length >= 16 && /^[A-Za-z0-9+/]+=*$/.test(compact)) { try { candidates.push(fromBase64(compact)); } catch (e) { /* base64 ではなかった */ } }
+  let best = text;
+  for (const bs of candidates) {
+    for (const cs of [charset, 'iso-2022-jp', 'shift_jis', 'euc-jp', 'utf-8']) {
+      const t = decodeAs(bs, cs);
+      if (japaneseChars(t) > japaneseChars(best)) best = t;
+    }
+  }
+  return best;
+}
+
+function fromBase64(b64) {
   const bin = atob(b64 + '==='.slice((b64.length + 3) % 4));
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  try { return new TextDecoder(charset).decode(bytes); } catch (e) { return new TextDecoder('utf-8').decode(bytes); }
+  return bytes;
+}
+function fromQuotedPrintable(s) {
+  const t = s.replace(/=\r?\n/g, '');
+  const out = [];
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === '=' && /^[0-9A-F]{2}$/i.test(t.substr(i + 1, 2))) { out.push(parseInt(t.substr(i + 1, 2), 16)); i += 2; } else out.push(t.charCodeAt(i) & 0xff);
+  }
+  return new Uint8Array(out);
+}
+function decodeAs(bytes, charset) {
+  try { return new TextDecoder(charset).decode(bytes); } catch (e) { return ''; }
 }
 
 /** HTML のメールを文字だけに（改行は残す） */
