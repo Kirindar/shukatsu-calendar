@@ -154,7 +154,7 @@ function gmailCost(url) {
 }
 // 前回の読み取りの数字（どこで時間がかかったかを見るため）：開いたスレッド・開かなかったスレッド・新しく読んだメール・
 // 上限で待った時間（同時にいくつ待っていても、時計の上での時間）・上限のエラーの回数と、Gmail が言った理由
-export const stats = { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {}, searches: [] };
+export const stats = { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {}, searches: [], thinBodies: [] };
 // 問い合わせの種類ごとの回数と、上限のエラーの回数（どれが「重い」かを見るため）：検索（一覧）・スレッドを開く
 const callType = url => (/\/threads\?/.test(url) ? '検索' : /\/threads\//.test(url) ? 'スレッドを開く' : /\/profile/.test(url) ? 'プロフィール' : 'そのほか');
 function count(url, key) {
@@ -247,7 +247,7 @@ export async function getProfileEmail() {
  */
 export async function runGmailStepsAsync(steps, cachedIds, onProgress, known) {
   known = known || {};
-  Object.assign(stats, { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {}, searches: [] });
+  Object.assign(stats, { opened: 0, skipped: 0, read: 0, waitedMs: 0, limitErrors: 0, limitReason: '', byType: {}, searches: [], thinBodies: [] });
   const pages = new Map();  // 検索の言葉 → 見つかったスレッド（ページをめくって足していく）
   const threads = new Map(); // スレッドの id → { last（いちばん新しいメールの日時）, ids（下書きを除くメールの id。まだ開いていなければ null）, history }
   let read = 0;
@@ -261,6 +261,7 @@ export async function runGmailStepsAsync(steps, cachedIds, onProgress, known) {
     stats.opened++;
     stats.read += fresh.length;
     if (fresh.length && onProgress) onProgress(read);
+    for (const m of fresh) await fillBody(m);
     threads.set(t.id, { last: Math.max(0, ...msgs.map(m => Number(m.internalDate) || 0)), ids: msgs.map(m => m.id), history: th.historyId || t.historyId,
       full: new Map(fresh.map(m => [m.id, toMessage(m)])) });
   };
@@ -294,6 +295,29 @@ export async function runGmailStepsAsync(steps, cachedIds, onProgress, known) {
   return step.value;
 }
 
+/**
+ * 本文がほとんど読めないメールは、本文を取りに行く（Gmail は大きい本文の代わりに attachmentId だけ返すことがある）。
+ * それでも本文がほとんどないメールは、作り（部分の種類・大きさ）を stats.thinBodies に残す（ログに出す。本文は入れない）
+ */
+async function fillBody(m) {
+  if (japaneseChars(plainBody(m.payload || {})) >= 10) return;
+  const parts = [];
+  const walk = p => { if (!p) return; parts.push(p); (p.parts || []).forEach(walk); };
+  walk(m.payload);
+  for (const p of parts) {
+    if (/^text\/(plain|html)/i.test(p.mimeType || '') && p.body && !p.body.data && p.body.attachmentId) {
+      const a = (await api(GMAIL + 'messages/' + m.id + '/attachments/' + p.body.attachmentId)) || {};
+      if (a.data) p.body.data = a.data;
+    }
+  }
+  const text = plainBody(m.payload || {});
+  if (japaneseChars(text) >= 10) return;
+  const subject = (((m.payload || {}).headers || []).find(h => h.name.toLowerCase() === 'subject') || {}).value || '';
+  const desc = p => (p.mimeType || '?') + '（' + ((p.body && p.body.size) || 0) + 'バイト' + (p.body && p.body.data ? '' : p.body && p.body.attachmentId ? '・別の場所' : '・なし') +
+    (p.filename ? '・ファイル名あり' : '') + '）';
+  stats.thinBodies.push({ subject, parts: parts.map(desc).join(' / '), chars: text.length, jp: japaneseChars(text) });
+}
+
 async function searchThreads(pages, q, need) {
   let p = pages.get(q);
   if (!p) { p = { list: [], token: undefined, done: false }; pages.set(q, p); }
@@ -318,14 +342,16 @@ export function toMessage(m) {
 
 /** 本文：text/plain があればそれ、なければ text/html を文字にしたもの（Apps Script の getPlainBody と同じ考え） */
 export function plainBody(payload) {
-  const parts = [];
+  const parts = [], files = [];
   const walk = p => {
     if (!p) return;
     const isFile = p.filename && p.filename.length;
-    if (!isFile && p.body && p.body.data && /^text\/(plain|html)/i.test(p.mimeType || '')) parts.push(p);
+    if (p.body && p.body.data && /^text\/(plain|html)/i.test(p.mimeType || '')) (isFile ? files : parts).push(p);
     (p.parts || []).forEach(walk);
   };
   walk(payload);
+  // 本文がなく、名前の付いた HTML だけのメール（本文を「ファイル」として送る採用システムがある）は、その HTML を本文にする
+  if (!parts.length) parts.push(...files.filter(p => /^text\/html/i.test(p.mimeType)));
   const plain = parts.find(p => /^text\/plain/i.test(p.mimeType));
   const html = parts.find(p => /^text\/html/i.test(p.mimeType));
   const plainText = plain ? decodePart(plain) : '';

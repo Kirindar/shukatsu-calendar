@@ -223,16 +223,16 @@ async function prefetch(full, label) {
   const props = PropertiesService.getUserProperties();
   let known = {};
   try { known = JSON.parse(props.getProperty(THREADS_KEY) || '{}'); } catch (e) { known = {}; }
-  // 前の版で、HTML 版の代わりの英語の案内を本文として保存してしまったメール（ベイカレント）を、一度だけ消して読み直す
+  // 前の版で、本文を読めずに保存してしまったメール（英語の案内だけ・本文が別の場所。ベイカレント）を、一度だけ消して読み直す
   // （件名は日本語なのに本文にほとんど日本語がないもの。そのスレッドを開き直すため、60日ぶん検索し直す）
-  if (!props.getProperty('BODY_FIX_V1')) {
+  if (!props.getProperty('BODY_FIX_V2')) {
     const bad = [...readCache(SS).map.values()].filter(d => G.japaneseChars(d.subject) > 0 && G.japaneseChars(d.body) < 10);
     if (bad.length) {
       dropCached(new Set(bad.map(d => d.id)));
       bad.forEach(d => { delete known[d.thread]; cachedIds.delete(d.id); });
       full = true;
     }
-    props.setProperty('BODY_FIX_V1', '1');
+    props.setProperty('BODY_FIX_V2', '1');
   }
   hint('Gmail を読んでいます' + label + '…');
   const result = await G.runGmailStepsAsync(collectSteps(SS, table.rows, full, now, blocked), cachedIds, n => hint('Gmail を読んでいます' + label + '… 新しいメール ' + n + ' 通'), known);
@@ -294,6 +294,10 @@ function logText(s, timing) {
   const t = v => { const d = v instanceof Date ? v : new Date(v); return isNaN(d.getTime()) ? '' : d.getFullYear() + '/' + pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
   const lines = ['就活カレンダーのログ（' + t(new Date()) + ' の更新）', '', '■ 更新の情報', timing, '', '■ Gmail の検索（言葉 → 見つかったスレッドの数）'];
   (s.searches || []).forEach(x => lines.push(x.q + ' → ' + x.found + (x.more ? '（まだ先あり）' : '')));
+  // 本文がほとんど読めなかったメール（件名と、メールの作り。本文は入れない）
+  lines.push('', '■ 本文がほとんど読めなかったメール（今回 Gmail から読んだもの）');
+  (s.thinBodies || []).forEach(x => lines.push(x.subject + ' | 読めた文字 ' + x.chars + '（日本語 ' + x.jp + '） | ' + x.parts));
+  if (!(s.thinBodies || []).length) lines.push('なし');
   lines.push('', '■ メールごとの判断（新しい順）', 'メールの日時 | 会社（メールから） | 件名 | 選考種別 | 結果 | くわしく');
   const tr = SS.getSheetByName(CONFIG.TRACE_SHEET);
   if (tr) tr.getDataRange().getValues().slice(1).forEach(r => { if (r[0]) lines.push([t(r[0])].concat(r.slice(1).map(v => String(v))).join(' | ')); });
