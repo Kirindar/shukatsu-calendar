@@ -327,10 +327,18 @@ export function plainBody(payload) {
   };
   walk(payload);
   const plain = parts.find(p => /^text\/plain/i.test(p.mimeType));
-  if (plain) return decodePart(plain);
   const html = parts.find(p => /^text\/html/i.test(p.mimeType));
-  return html ? htmlToText(decodePart(html)) : '';
+  const plainText = plain ? decodePart(plain) : '';
+  if (!html) return plainText;
+  const htmlText = htmlToText(decodePart(html));
+  // 文字だけの版が、HTML 版の代わりの案内（英語の「HTML で見てください」など）で本文が入っていないときは、HTML 版を読む（ベイカレント）。
+  // 日本語の文字が HTML 版の半分もなければ、代わりの案内とみる
+  if (plain && japaneseChars(plainText) >= japaneseChars(htmlText) / 2) return plainText;
+  return htmlText || plainText;
 }
+
+/** 日本語（ひらがな・カタカナ・漢字）の文字の数 */
+export const japaneseChars = s => (String(s || '').match(/[぀-ヿ一-鿿]/g) || []).length;
 
 /** 本文の中身（base64url）を文字に。文字コードは Content-Type の charset（iso-2022-jp・shift_jis なども） */
 export function decodePart(p) {

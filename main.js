@@ -223,6 +223,17 @@ async function prefetch(full, label) {
   const props = PropertiesService.getUserProperties();
   let known = {};
   try { known = JSON.parse(props.getProperty(THREADS_KEY) || '{}'); } catch (e) { known = {}; }
+  // 前の版で、HTML 版の代わりの英語の案内を本文として保存してしまったメール（ベイカレント）を、一度だけ消して読み直す
+  // （件名は日本語なのに本文にほとんど日本語がないもの。そのスレッドを開き直すため、60日ぶん検索し直す）
+  if (!props.getProperty('BODY_FIX_V1')) {
+    const bad = [...readCache(SS).map.values()].filter(d => G.japaneseChars(d.subject) > 0 && G.japaneseChars(d.body) < 10);
+    if (bad.length) {
+      dropCached(new Set(bad.map(d => d.id)));
+      bad.forEach(d => { delete known[d.thread]; cachedIds.delete(d.id); });
+      full = true;
+    }
+    props.setProperty('BODY_FIX_V1', '1');
+  }
   hint('Gmail を読んでいます' + label + '…');
   const result = await G.runGmailStepsAsync(collectSteps(SS, table.rows, full, now, blocked), cachedIds, n => hint('Gmail を読んでいます' + label + '… 新しいメール ' + n + ' 通'), known);
   // 保存済みのメールがないスレッドは忘れる（古くなって消えたスレッドを、いつまでも覚えておかない）
@@ -230,6 +241,15 @@ async function prefetch(full, label) {
   for (const id in known) if (!live.has(id)) delete known[id];
   props.setProperty(THREADS_KEY, JSON.stringify(known));
   return result;
+}
+
+/** 読み込み済みメールから、ids のメールを消す（次の更新で Gmail から読み直す） */
+function dropCached(ids) {
+  const cache = readCache(SS);
+  const keep = [...cache.map.values()].filter(d => !ids.has(d.id));
+  cache.sheet.clearContents();
+  cache.sheet.getRange(1, 1, 1, 6).setValues([['id', '日時', '差出人', '件名', '本文', 'スレッド']]);
+  if (keep.length) cache.sheet.getRange(2, 1, keep.length, 6).setValues(keep.map(d => [d.id, d.date.getTime(), d.from, d.subject, d.body, d.thread]));
 }
 
 /** Gmail に問い合わせず、保存済みのメールだけで表を作り直す（表に会社を足したときなど）。「読み終わった」しるしは付けない */
