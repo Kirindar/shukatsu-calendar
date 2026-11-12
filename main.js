@@ -298,10 +298,31 @@ function logText(s, timing) {
   lines.push('', '■ 本文がほとんど読めなかったメール（今回 Gmail から読んだもの）');
   (s.thinBodies || []).forEach(x => lines.push(x.subject + ' | 読めた文字 ' + x.chars + '（日本語 ' + x.jp + '） | ' + x.parts));
   if (!(s.thinBodies || []).length) lines.push('なし');
-  lines.push('', '■ メールごとの判断（新しい順）', 'メールの日時 | 会社（メールから） | 件名 | 選考種別 | 結果 | くわしく');
   const tr = SS.getSheetByName(CONFIG.TRACE_SHEET);
-  if (tr) tr.getDataRange().getValues().slice(1).forEach(r => { if (r[0]) lines.push([t(r[0])].concat(r.slice(1).map(v => String(v))).join(' | ')); });
+  const traceRows = tr ? tr.getDataRange().getValues().slice(1).filter(r => r[0]) : [];
+  // 自動の診断：大事そうなメール（選考結果・日程など）なのに読み取れなかったものは、キーワードのまわりの本文を抜き出す（名前・URL・番号は伏せる）
+  lines.push('', '■ 自動の診断：読み取れなかった大事そうなメール（本文の抜き出し。名前・URL・番号は伏せています）');
+  const cache = [...readCache(SS).map.values()];
+  const picked = traceRows.filter(r => r[4] === '読み取れなかった' && /選考結果|結果|内定|日程|面接|予約|確定|通過|合否/.test(String(r[2]))).slice(0, 10);
+  picked.forEach(r => {
+    const at = new Date(r[0]).getTime();
+    const d = cache.find(m => m.subject === String(r[2]) && Math.abs(m.date.getTime() - at) < 60000);
+    lines.push(t(r[0]) + ' | ' + r[2] + ' | ' + (d ? excerpt(d.body) : '（保存したメールが見つからない）'));
+  });
+  if (!picked.length) lines.push('なし');
+  lines.push('', '■ メールごとの判断（新しい順）', 'メールの日時 | 会社（メールから） | 件名 | 選考種別 | 結果 | くわしく');
+  traceRows.forEach(r => lines.push([t(r[0])].concat(r.slice(1).map(v => String(v))).join(' | ')));
   return lines.join('\n');
+}
+
+/** 本文の、結果・日時などの言葉のまわり（180文字くらい）。名前（〇〇様）・URL・メールアドレス・長い番号は伏せる。改行は ⏎ */
+function excerpt(body) {
+  const text = String(body || '');
+  const i = text.search(/内々?定|見送|お断り|合格|通過|結果|日時|日程|開催|期限|締切/);
+  const part = i < 0 ? text.slice(0, 180) : text.slice(Math.max(0, i - 60), i + 120);
+  return part.replace(/https?:\/\/\S+/g, '[URL]').replace(/[\w.+-]+@[\w.-]+/g, '[メール]').replace(/\d{6,}/g, '[番号]')
+    .replace(/[^\s、。「」『』【】（）()]{1,8}[ 　]?[^\s、。「」『』【】（）()]{0,8}[ 　]?(様|さま)/g, '〇〇$1')
+    .replace(/\r?\n/g, ' ⏎ ');
 }
 
 /**

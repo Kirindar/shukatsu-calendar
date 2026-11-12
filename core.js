@@ -610,7 +610,8 @@ const INTERN_JOIN = /(インターン|仕事体験|ジョブ|プログラム).{0
 
 /** 選考の結果のメールなら、新しい「状況」（NG／内定／インターン参加決定）。それ以外は空 */
 function resultOf(subject, body) {
-  const t = subject + '\n' + body.slice(0, 1500);
+  // 1行が短く折り返してあるメール（「内定と⏎させていただく」）でも読めるように、日本語の途中の改行と行頭の空白はつなぐ
+  const t = (subject + '\n' + body.slice(0, 1500)).replace(/([^\x00-\x7F])[ \t　]*\r?\n[ \t　]*(?=[^\x00-\x7F])/g, '$1');
   if (!/結果|選考|応募|面接|合否|内々?定|インターン|ご縁/.test(t)) return '';
   if (REJECT_WORDS.test(t) && !PASS_WORDS.test(t)) return 'NG';
   if (OFFER_WORDS.test(t) && !OFFER_NOT.test(subject)) return '内定';

@@ -1,7 +1,7 @@
 // オフラインでも開けるように、アプリのファイルを端末にしまっておく。
 // ネットにつながるときは新しいファイルを取りに行き（アップデートがすぐ届く）、つながらないときはしまったものを使う。
 // Google とのやり取り（ログイン・Gmail・ドライブ）は、しまわない
-const VERSION = '20261111003441';
+const VERSION = '20261113002137';
 const CACHE = 'shukatsu-calendar-' + VERSION;
 const FILES = ['./', 'index.html', 'sheet.js', 'core.js', 'google.js', 'store.js', 'main.js', 'tour.js', 'config.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
