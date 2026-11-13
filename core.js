@@ -886,6 +886,9 @@ function nextStepOf(text) {
   // 「次回【4次選考:人事面接】にご案内」とはっきり書いてあれば、その段階（「3次選考へご参加いただき」の3次選考ではない）
   const explicit = t.match(/次回[^。\n]{0,6}?(?:([一二三四1-4])次(面接|選考)|最終(面接|選考))/);
   if (explicit) return explicit[1] ? nthInterview(explicit[1], explicit[2]) : '最終面接';
+  // 「グループディスカッション結果のご連絡および個人面接のご案内」：「および」のあとに案内している段階が次の選考（EYSC）
+  const guide = t.match(/(?:および|及び|ならびに)\s*([^。\n、]{1,20}?)の?(?:ご案内|案内)/);
+  if (guide && stepOf(guide[1])) return stepOf(guide[1]);
   const stagesIn = s => [...s.matchAll(/([一二三四1-4])次(面接|選考)|最終(面接|選考)/g)].map(m => (m[1] ? nthInterview(m[1], m[2]) : '最終面接'));
   const passed = [...t.matchAll(PASSED_STAGE)].flatMap(m => stagesIn(m[0]));
   const floor = Math.max(-1, ...passed.map(stepRank));
@@ -3090,10 +3093,13 @@ function render() {
   const byWhen = (a, b) => (a.when ? new Date(a.when).getTime() : Infinity) - (b.when ? new Date(b.when).getTime() : Infinity);
   // やること（期限までに自分がやる）：選考の締切（ESの提出・面接の予約）と、頼まれごと・自分で足したもの
   //  （面接のあとにやることは、面接が始まるまで出さない）
+  //  日程調整が必要な選考（面接の予約がまだ・候補日の返信がまだ）も、自分がやることなのでタスクに出す（期限はないので下のほう）
   const todo = DATA.upcoming.filter(x => x.slot === '締切')
-    .concat((DATA.tasks || []).filter(x => !x.hold).map(x => Object.assign({ task: true }, x))).sort(byWhen);
+    .concat((DATA.tasks || []).filter(x => !x.hold).map(x => Object.assign({ task: true }, x)))
+    .concat(DATA.undecided.filter(x => x.slot === '日程調整').map(x => Object.assign({}, x, { label: x.step + 'の予約（日程を決める）' })))
+    .sort(byWhen);
   const td = $('todo'); td.replaceChildren();
-  todo.forEach(x => td.append(x.task ? taskRow(x) : row(x, true)));
+  todo.forEach(x => td.append(x.task ? taskRow(x) : row(x, !!x.when)));
   if (!todo.length) td.append(el('div', 'empty', 'ありません'));
   // 予定（その日時に参加する）：面接・GDなどの日程と、面談など
   const plans = DATA.upcoming.filter(x => x.slot !== '締切').concat(DATA.appts || []).sort(byWhen);
