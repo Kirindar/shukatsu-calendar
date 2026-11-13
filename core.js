@@ -745,7 +745,8 @@ function eventStep(subject, near, above) {
 function selectionKind(subject, body) {
   if (INTERN_WORDS.test(subject)) return 'インターン';
   if (HONSENKO_WORDS.test(subject)) return '本選考';
-  const t = body.slice(0, 800);
+  // 「インターンシップ及び採用選考を通し」のように両方の話をしている文は、どちらとも決めない（日本IBM）
+  const t = body.slice(0, 800).replace(/インターン(シップ)?\s*(及び|および|や|と|・|、)\s*[^。\n]{0,6}選考/g, '');
   if (INTERN_WORDS.test(t)) return 'インターン';
   if (HONSENKO_WORDS.test(t)) return '本選考';
   return UNKNOWN_KIND;
@@ -845,6 +846,13 @@ function readMail(d, now) {
   // 段階が書いていない「本エントリー締切」：締切まとめの「エントリー」（表の行には書かない）
   const entry = deadlines.filter(dl => /エントリー|応募/.test(subject + '\n' + dl.near + '\n' + dl.above.join('\n'))).sort((a, b) => a.date - b.date);
   if (entry.length) return { ...base, type: '締切', slot: DEADLINE, step: '', entry: true, when: entry[0].date, passed, reason: 'エントリーの締切' };
+  // 3b. 提出の確認に「次のステップは、WEBテスト受検です」と次の選考が書いてあるもの（日時・締切なし）→ 次の選考だけ（日本IBM）
+  const head = body.slice(0, 500);
+  const nextGuide = head.match(/次の(ステップ|選考|段階)は[、,\s]*([^。\n]{1,20})/);
+  if (nextGuide && !broadcast && !ENTRY_AD.test(subject) && /(ご)?提出(いただき|頂き|ありがとう)|(受付|受け付け)(いた|致)?しました|受領(いた|致)?しました/.test(head)) {
+    const next = stepOf(nextGuide[2]);
+    if (next && next !== 'ES') return { ...base, type: '通過', slot: '', step: next, reason: '提出の確認（次は' + next + '）' };
+  }
   // 4. 通過の連絡で、日時・締切が書いていないもの（「一次面接は通過とし、次回は二次面接」）→ 次の選考だけ
   //    （「特別選考にご案内させていただきたく」のようなスカウトの宣伝は、通過の連絡とは読まない）
   if (STRONG_PASS.test(subject + '\n' + body.slice(0, 1500)) && !broadcast && !ENTRY_AD.test(subject) && !/スカウト|オファー|特別選考|選考免除|面接確約/.test(subject)) {
