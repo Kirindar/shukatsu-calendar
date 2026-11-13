@@ -18,7 +18,8 @@ const ACTIONS = ['refreshFromWeb', 'resolveReview', 'resolveCandidate', 'resolve
   'updateCompany', 'deleteCompany', 'setBlocked', 'addBlocked', 'removeBlocked', 'importAll', 'exportAll', 'removeAutoAdded', 'restoreRemoved',
   'hideUndecided', 'unhideUndecided', 'restoreDeadline'];
 const READ_ONLY = ['exportAll']; // ログインも保存もいらない
-const FIRST_DAYS = 7;               // 最初の更新で、まず読む日数（読めたら画面に出し、残りは裏で読む）
+const APP_VERSION = '20261113112836';          // アプリの版（build.ps1 が公開のたびに書きかえる。ログに出す）
+const FIRST_DAYS = 7;              // 最初の更新で、まず読む日数（読めたら画面に出し、残りは裏で読む）
 const $ = id => document.getElementById(id);
 const ORIGINAL_COLLECT = window.collectMails;
 
@@ -294,7 +295,10 @@ async function readAndSave(full, label) {
 function logText(s, timing) {
   const pad = n => String(n).padStart(2, '0');
   const t = v => { const d = v instanceof Date ? v : new Date(v); return isNaN(d.getTime()) ? '' : d.getFullYear() + '/' + pad(d.getMonth() + 1) + '/' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
-  const lines = ['就活カレンダーのログ（' + t(new Date()) + ' の更新）', '', '■ 更新の情報', timing, '', '■ Gmail の検索（言葉 → 見つかったスレッドの数）'];
+  // どの版が・どの端末で動いたか（古い版のまま更新していないかを見るため）
+  const device = /iPhone|iPad|Android|Mobi/i.test(navigator.userAgent) ? 'スマホ' : 'パソコン';
+  const lines = ['就活カレンダーのログ（' + t(new Date()) + ' の更新）', 'アプリの版：' + APP_VERSION + '・端末：' + device + (navigator.standalone || matchMedia('(display-mode: standalone)').matches ? '（ホーム画面のアプリ）' : '（ブラウザ）'),
+    '', '■ 更新の情報', timing, '', '■ Gmail の検索（言葉 → 見つかったスレッドの数）'];
   (s.searches || []).forEach(x => lines.push(x.q + ' → ' + x.found + (x.more ? '（まだ先あり）' : '')));
   // 本文がほとんど読めなかったメール（件名と、メールの作り。本文は入れない）
   lines.push('', '■ 本文がほとんど読めなかったメール（今回 Gmail から読んだもの）');
@@ -552,7 +556,19 @@ function whenGis() {
 }
 
 async function boot() {
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    // 新しい版が届いたら、その場で切りかえて読み直す（古い版のまま「メールから更新」しないように）。
+    // 初めて開いたとき（まだ前の版がないとき）と、メールを読んでいる途中は読み直さない
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || reloading || queued) return;
+      reloading = true;
+      location.reload();
+    });
+    // sw.js 自体もブラウザに取っておかず、開くたびに新しい版がないか確かめる
+    navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).then(reg => reg.update()).catch(() => {});
+  }
   let snap = null;
   try { snap = await store.get(SNAP); } catch (e) { snap = null; }
   if (snap && snap.sheets) {
