@@ -3057,9 +3057,13 @@ function renderCompanies() {
     const nm = el('b', null, x.name);
     if (x.autoKey) nm.append(el('span', 'auto-mini', '自動'));
     c1.append(nm, el('small', null, [x.kind !== '不明' ? x.kind : '', coGroup(x) === '選考中' ? '' : x.state].filter(v => v).join('・')));
-    const step = x.waitFor ? x.waitFor + 'の結果待ち' : x.step === '結果待ち' ? '結果待ち' : x.label || (coGroup(x) === '選考中' ? '未定' : '');
+    // 内定・NGなど選考が終わった会社は、次の選考・日時を出さない（「最終面接の結果待ち」のまま残っていても）
+    const ended = coGroup(x) !== '選考中';
+    const step = ended ? '' : x.waitFor ? x.waitFor + 'の結果待ち' : x.step === '結果待ち' ? '結果待ち' : x.label || '未定';
     const c3 = el('div', 'co-when');
-    if (x.when) {
+    if (ended) {
+      // 何も出さない
+    } else if (x.when) {
       const left = daysLeft(x.when);
       if (left >= 0) c3.append(el('span', 'badge' + (left <= 1 ? ' red' : left <= DATA.warnDays ? ' yellow' : ''), left === 0 ? '今日' : left === 1 ? '明日' : 'あと' + left + '日'));
       c3.append(el('small', null, fmt(x.when) + (left < 0 ? '（過ぎた）' : '')));
@@ -3321,16 +3325,19 @@ function showPop(x, anchor) {
   const close = el('button', 'close', '×');
   close.setAttribute('aria-label', '閉じる');
   close.onclick = hidePop;
+  // 内定・NGなど選考が終わった会社の行は、「結果待ち」などではなく、その状況を出す
+  const ended = !x.task && !x.appt && !x.hist && ['内定', 'インターン参加決定', 'NG', '辞退'].includes(x.state);
   const kind = x.hist ? '過ぎた予定の記録（' + (x.type === '提出' ? '提出' : x.type === '面談' ? '選考外' : '選考') + '）' : x.task ? 'タスク（' + (x.manual ? '自分で追加' : '会社からの依頼') + '）'
+    : ended ? '選考が終わった会社'
     : x.step === '結果待ち' ? '結果待ち' : !x.when && !x.appt ? (x.slot === '日程調整' ? '日程未定（日程調整が必要）' : x.slot === '確定待ち' ? '日程未定（確定待ち）' : '日程未定')
     : x.appt ? '予定（選考外）' : x.slot === '締切' ? 'タスク（選考）' : '予定（選考）';
-  const what = x.task ? (x.detail || x.what) : x.appt || x.hist ? x.what : x.waitFor ? x.waitFor + 'の結果待ち' : x.label;
+  const what = x.task ? (x.detail || x.what) : x.appt || x.hist ? x.what : ended ? x.state : x.waitFor ? x.waitFor + 'の結果待ち' : x.label;
   const end = x.end ? '〜' + new Date(x.end).getHours() + ':' + pad(new Date(x.end).getMinutes()) : '';
   const dl = el('dl');
   const add = (k, v) => { if (v) dl.append(el('dt', null, k), el('dd', null, v)); };
-  add(x.slot === '締切' || x.task ? '期限' : '日時', fmt(x.when) + end + (x.hold ? '（面接のあと）' : ''));
+  if (!ended) add(x.slot === '締切' || x.task ? '期限' : '日時', fmt(x.when) + end + (x.hold ? '（面接のあと）' : ''));
   add('種類', kind);
-  if (!x.task && !x.appt && !x.hist) add('状況', [x.kind, x.waitFor || x.state].filter(v => v).join('・'));
+  if (!x.task && !x.appt && !x.hist) add('状況', [x.kind, ended ? x.state : x.waitFor || x.state].filter(v => v).join('・'));
   if (x.hist || x.result) add('結果', x.result || 'まだ（結果のメールが来たら書き足します）');
   if (x.memo) add('メモ', x.memo);
   pop.append(close, el('h3', null, x.name || '（会社なし）'), el('div', 'what', what), dl);
