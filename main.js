@@ -224,15 +224,17 @@ async function prefetch(full, label) {
   let known = {};
   try { known = JSON.parse(props.getProperty(THREADS_KEY) || '{}'); } catch (e) { known = {}; }
   // 前の版で、本文を読めずに保存してしまったメール（英語の案内だけ・本文が別の場所・文字化け。ベイカレント）を、一度だけ消して読み直す
-  // （件名は日本語なのに本文にほとんど日本語がないもの。そのスレッドを開き直すため、60日ぶん検索し直す）
-  if (!props.getProperty('BODY_FIX_V3')) {
-    const bad = [...readCache(SS).map.values()].filter(d => G.japaneseChars(d.subject) > 0 && G.japaneseChars(d.body) < 10);
+  // （件名は日本語なのに本文にほとんど日本語がないものと、UTF-8 を Shift_JIS で読んで化けたもの（「縺」「繧」「繝」がたくさん出る）。
+  //  そのスレッドを開き直すため、60日ぶん検索し直す）
+  if (!props.getProperty('BODY_FIX_V4')) {
+    const garbled = s => (String(s).match(/[縺繧繝]/g) || []).length >= 8;
+    const bad = [...readCache(SS).map.values()].filter(d => G.japaneseChars(d.subject) > 0 && (G.japaneseChars(d.body) < 10 || garbled(d.body)));
     if (bad.length) {
       dropCached(new Set(bad.map(d => d.id)));
       bad.forEach(d => { delete known[d.thread]; cachedIds.delete(d.id); });
       full = true;
     }
-    props.setProperty('BODY_FIX_V3', '1');
+    props.setProperty('BODY_FIX_V4', '1');
   }
   hint('Gmail を読んでいます' + label + '…');
   const result = await G.runGmailStepsAsync(collectSteps(SS, table.rows, full, now, blocked), cachedIds, n => hint('Gmail を読んでいます' + label + '… 新しいメール ' + n + ' 通'), known);

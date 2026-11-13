@@ -371,6 +371,11 @@ export function decodePart(p) {
   const ct = (((p.headers || []).find(h => h.name.toLowerCase() === 'content-type') || {}).value) || p.mimeType || '';
   const charset = ((ct.match(/charset="?([^";\s]+)"?/i) || [])[1] || 'utf-8').toLowerCase();
   const bytes = fromBase64(p.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+  // 本当は UTF-8 なのに、文字コードの名前が shift_jis などになっているメール（ベイカレント。「蟆セ蠖「 菴ウ…」のように化ける）：
+  // UTF-8 として正しく読めて日本語があれば UTF-8 にする（本物の Shift_JIS の本文は、UTF-8 として正しく読めることはほとんどない）
+  if (charset !== 'utf-8' && bytes.some(b => b >= 0x80)) {
+    try { const u = new TextDecoder('utf-8', { fatal: true }).decode(bytes); if (japaneseChars(u) > 0) return u; } catch (e) { /* UTF-8 ではない */ }
+  }
   const text = decodeAs(bytes, charset) || decodeAs(bytes, 'utf-8');
   if (japaneseChars(text) > 0) return text;
   // 日本語が1文字もない：文字化けかもしれない（ベイカレントなど）。送るための包み（quoted-printable・base64）がほどけていないものはほどき、
