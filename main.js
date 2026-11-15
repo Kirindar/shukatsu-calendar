@@ -14,11 +14,11 @@ const SNAP = 'snapshot';
 const DATA_FILE = 'data.json.gz';   // 表・タスク・締切まとめ・設定など
 const MAIL_FILE = 'mails.json.gz';  // 読み込み済みメール（大きいので、増えたときだけ保存）
 // 画面から呼べる core.js の関数（Apps Script 版で google.script.run から呼ぶもの）
-const ACTIONS = ['refreshFromWeb', 'resolveReview', 'resolveCandidate', 'resolveDeadline', 'addTask', 'doneTask', 'addCompany',
+const ACTIONS = ['refreshFromWeb', 'resolveReview', 'resolveDeadline', 'addTask', 'doneTask', 'addCompany',
   'updateCompany', 'deleteCompany', 'setBlocked', 'addBlocked', 'removeBlocked', 'importAll', 'exportAll', 'removeAutoAdded', 'restoreRemoved',
   'hideUndecided', 'unhideUndecided', 'restoreDeadline'];
 const READ_ONLY = ['exportAll']; // ログインも保存もいらない
-const APP_VERSION = '20261113181429';          // アプリの版（build.ps1 が公開のたびに書きかえる。ログに出す）
+const APP_VERSION = '20261116004336';          // アプリの版（build.ps1 が公開のたびに書きかえる。ログに出す）
 const FIRST_DAYS = 7;              // 最初の更新で、まず読む日数（読めたら画面に出し、残りは裏で読む）
 const $ = id => document.getElementById(id);
 const ORIGINAL_COLLECT = window.collectMails;
@@ -513,7 +513,7 @@ $('menu-signout').onclick = async () => {
 
 // データを全部消す（検証用：最初の更新を、まっさらな状態から試すため）。もとに戻せないので2回確かめる
 $('menu-wipe').onclick = () => {
-  if (!confirm('Googleドライブ に保存したデータ（会社一覧・タスク・締切まとめ・読み込み済みメールなど）と、この端末の保存を、全部消しますか？\n\nもとに戻せません。残したいときは、先に「設定」→「書き出す」でファイルに保存してください。')) return;
+  if (!confirm('Googleドライブ に保存したデータ（会社一覧・やること・締切・読み込み済みメールなど）と、この端末の保存を、全部消しますか？\n\nもとに戻せません。残したいときは、先に「設定」→「書き出す」でファイルに保存してください。')) return;
   if (!confirm('本当に消しますか？')) return;
   const tokenReady = CLIENT_ID ? G.ensureToken() : Promise.reject(new Error('設定がまだです')); // ボタンを押したその場で
   const btn = $('menu-wipe');

@@ -300,6 +300,7 @@ export async function runGmailStepsAsync(steps, cachedIds, onProgress, known) {
  * それでも本文がほとんどないメールは、作り（部分の種類・大きさ）を stats.thinBodies に残す（ログに出す。本文は入れない）
  */
 async function fillBody(m) {
+  await fillCalendar(m);
   if (japaneseChars(plainBody(m.payload || {})) >= 10) return;
   const parts = [];
   const walk = p => { if (!p) return; parts.push(p); (p.parts || []).forEach(walk); };
@@ -316,6 +317,25 @@ async function fillBody(m) {
   const desc = p => (p.mimeType || '?') + '（' + ((p.body && p.body.size) || 0) + 'バイト' + (p.body && p.body.data ? '' : p.body && p.body.attachmentId ? '・別の場所' : '・なし') +
     (p.filename ? '・ファイル名あり' : '') + '）';
   stats.thinBodies.push({ subject, parts: parts.map(desc).join(' / '), chars: text.length, jp: japaneseChars(text) });
+}
+
+/**
+ * カレンダーの招待（.ics）が付いたメール（TimeRex・Google カレンダーの招待など）：招待の日時・件名を読みやすい文にして、
+ * payload.icsText に入れる（plainBody が本文の最初に足す。日時の読み間違いがなくなる）。招待はふつう別の場所にあるので取りに行く
+ */
+async function fillCalendar(m) {
+  const parts = [];
+  const walk = p => { if (!p) return; parts.push(p); (p.parts || []).forEach(walk); };
+  walk(m.payload);
+  const cal = parts.find(p => /^text\/calendar/i.test(p.mimeType || '') || /\.ics$/i.test(p.filename || ''));
+  if (!cal || !cal.body || typeof globalThis.icsText !== 'function') return;
+  if (!cal.body.data && cal.body.attachmentId) {
+    const a = (await api(GMAIL + 'messages/' + m.id + '/attachments/' + cal.body.attachmentId)) || {};
+    if (a.data) cal.body.data = a.data;
+  }
+  if (!cal.body.data) return;
+  const text = globalThis.icsText(decodePart(cal));
+  if (text && m.payload) m.payload.icsText = text;
 }
 
 async function searchThreads(pages, q, need) {
@@ -342,6 +362,12 @@ export function toMessage(m) {
 
 /** 本文：text/plain があればそれ、なければ text/html を文字にしたもの（Apps Script の getPlainBody と同じ考え） */
 export function plainBody(payload) {
+  const text = bodyText(payload);
+  // カレンダーの招待を読んであれば、本文の最初に（長い本文は保存のときに後ろが切れるため）
+  return payload && payload.icsText ? payload.icsText + '\n\n' + text : text;
+}
+
+function bodyText(payload) {
   const parts = [], files = [];
   const walk = p => {
     if (!p) return;

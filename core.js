@@ -19,7 +19,7 @@ const CONFIG = {
   SOURCE_ID: '',
   SOURCE_SHEET: '選考状況',
   DAYS: 60,                 // 何日前までのメールを読むか
-  THREADS_PER_QUERY: 50,    // 1回の検索で読むスレッド数の上限
+  COMPANY_MAX_THREADS: 600, // 会社名の1回の検索で、何スレッドまで読むか（100ずつ続きを読む。メールの多い会社があっても読み落とさない）
   TERMS_PER_QUERY: 15,      // 1回の検索にまとめる会社の数
   WARN_DAYS: 4,             // 何日前から黄色にするか（前日からは赤）
   EVENT_HOURS: 2,           // 面接などの日程の何時間後に「結果待ち」にするか
@@ -37,6 +37,8 @@ const CONFIG = {
   BLOCK_SHEET: '読まない送信元',
   HISTORY_SHEET: '予定の記録',  // 過ぎた面接・GD・面談・提出（カレンダーに残す）
   HISTORY_MAX: 1500,           // 予定の記録の上限（超えたら古いものから消す）
+  FLOW_SHEET: '選考の流れ',     // メールから読んだ出来事を、会社ごとに全部残す（メールが古くなって消えても残る）
+  FLOW_MAX: 4000,              // 選考の流れの上限（超えたら古いものから消す）
   // 表にない会社の選考メール・締切の案内を探すときの、件名の言葉
   CANDIDATE_MAX_THREADS: 300, // 表にない会社のメールを、何スレッドまで探すか（新しいものから）
   CANDIDATE_DAYS: 30,         // 表にない会社のメールを、何日前まで探すか（候補・締切まとめに出すのは、これからの予定・締切なので短めに）
@@ -103,6 +105,18 @@ function getSpreadsheet() {
 }
 
 /** 表を読む。列は見出しの名前で探すので、列の順番を入れ替えても動く */
+/**
+ * 会社の別名にしても意味のない言葉か：採用システムのアドレスの中の、でたらめな文字の並び（da2l1gd7lf9ugvhul560）・
+ * 受け口の名前（mbox-bgeqnk・ats など）。前の版が自動で別名に入れていた。ドメイン・アドレスは別名として使えるので、意味がある
+ */
+function junkAlias(a) {
+  const s = String(a || '').toLowerCase();
+  if (!s || s.includes('.') || s.includes('@')) return false;
+  if (/^(ats|n-ats|mbox|bounce|reply|noreply|no-reply|notifications?)([-_].*)?$/.test(s)) return true;
+  // 英字と数字が何度も入れかわる（でたらめな ID）・長すぎる
+  return (s.match(/[a-z]\d|\d[a-z]/g) || []).length >= 3 || s.length > 20;
+}
+
 function readTable(ss) {
   const sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
   if (!sheet) throw new Error('「' + CONFIG.SHEET_NAME + '」シートがありません。先に setupSheet を実行してください。');
@@ -279,6 +293,8 @@ const SHARED_DOMAINS = ['i-webs.jp', 'e2r.jp', 'axol.jp', 'miws.jp', 'hrmos.co',
   'arorua.net', 'pearson.com']; // arorua.net・pearson.com（ピアソンVUE）：テストセンター（適性検査）の予約（受検する会社は本文の「受検企業」）
 // テストセンター：本文には会場を運営する会社（「株式会社キャリア総研」など）が書いてあるので、会社名は「受検企業」の欄からだけ読む
 const TEST_CENTERS = ['arorua.net', 'pearson.com'];
+// 採用システム・日程調整ツールなどの、会社名ではない受け口の名前（@の前・サブドメイン）。会社の別名にしない
+const GENERIC_LOCAL = /^(mail|info|no-?reply|noreply_tc|support|notice|notifications?|system|admin|contact|recruit|saiyo|jinji|candidate|n-ats|www|testcenter)$/;
 const FREE_MAIL = /^(gmail\.com|googlemail\.com|yahoo\.co\.jp|ymail\.ne\.jp|outlook\.(com|jp)|hotmail\.(com|co\.jp)|live\.jp|icloud\.com|me\.com|docomo\.ne\.jp|ezweb\.ne\.jp|au\.com|softbank\.ne\.jp|i\.softbank\.jp)$/;
 const inDomains = (key, list) => list.some(d => key === d || key.endsWith('.' + d) || key.endsWith('@' + d));
 
@@ -382,7 +398,47 @@ function extractCompany(subject, from, body) {
 }
 
 /** メールがどの行の会社のものか（会社名・別名・ドメインで探す） */
+// ----- 会社のドメイン：会社が自分のドメイン（quants.co.jp など）から送ったメールは、ドメインで会社を決める -----
+// どのドメインがどの会社かは、選考の流れ（前に読んだメールの会社とドメイン）と、会社一覧の「別名・ドメイン」から覚える（learnDomains）。
+// いろいろな会社が使う採用システム・日程調整ツール・テストセンター・大学・フリーメールは、会社のドメインではない
+
+let DOMAIN_COMPANY = new Map(); // ドメイン → 会社のキー（companyKey）。2つ以上の会社が使うドメインは ''（PwC のグループ会社など）
+
+/** 会社自身のドメインなら、そのドメイン（example.co.jp）。採用システムなど、いろいろな会社が使うものは空 */
+function ownDomain(sender) {
+  const s = String(sender || '');
+  if (!s.includes('.') || s.includes('@') || FREE_MAIL.test(s)) return '';
+  return inDomains(s, SHARED_DOMAINS.concat(TEST_CENTERS, SCHOOL_DOMAINS, JOB_MEDIA, SCHEDULER_DOMAINS)) ? '' : s;
+}
+const SCHEDULER_DOMAINS = ['eeasy.jp', 'timerex.net'];
+
+/** ドメインと会社の結びつきを覚え直す（会社一覧の別名と、選考の流れの出来事から） */
+function learnDomains(rows, flow) {
+  const m = new Map();
+  const add = (d, key) => { if (!d || !key) return; if (!m.has(d)) m.set(d, key); else if (m.get(d) !== key) m.set(d, ''); };
+  rows.forEach(r => (r.aliases || []).map(ownDomain).forEach(d => add(d, companyKey(r.name))));
+  (flow || []).forEach(e => add(ownDomain(e.domain), companyKey(e.name)));
+  DOMAIN_COMPANY = m;
+}
+
+/** key が text の中に、1つの言葉として出てくるか（前後が同じ種類の文字ではない：「SIMフリースマートフォン」の「フリー」は×） */
+function wordIn(text, key) {
+  const kind = c => (/[゠-ヿ]/.test(c || '') ? 'kana' : /[a-z0-9]/i.test(c || '') ? 'latin' : 'other');
+  for (let i = text.indexOf(key); i >= 0; i = text.indexOf(key, i + 1)) {
+    const before = text[i - 1], after = text[i + key.length];
+    if ((kind(before) === 'other' || kind(before) !== kind(key[0])) && (kind(after) === 'other' || kind(after) !== kind(key[key.length - 1]))) return true;
+  }
+  return false;
+}
+
 function rowsForMail(rows, f) {
+  // 0. 会社のドメインから届いたメールで、そのドメインの会社がわかっていれば、その会社の行だけ（本文にほかの会社名があっても迷わない）
+  const own = ownDomain(f.sender);
+  const known = own && DOMAIN_COMPANY.get(own);
+  if (known) {
+    const rs = rows.filter(r => companyKey(r.name) === known);
+    if (rs.length) return rs;
+  }
   const ck = companyKey(f.company);
   const label = domainLabel(f.sender);
   // アドレス全体の英字（cyberagent@snar.jp、xxx@freee.n-ats.hrmos.co の freee）と、件名の【】の中（【freee】）
@@ -404,6 +460,13 @@ function rowsForMail(rows, f) {
   if (byName.length) return byName;
   // 2. 差出人がほかの会社（「株式会社〇〇」）なら、本文に名前が出てくるだけの行には結びつけない（合同説明会の案内など）
   if (/株式会社|有限会社|合同会社/.test(f.company)) return [];
+  // 会社自身のドメインから届いたメールは、本文に名前が出てくるだけの行には結びつけない。件名に、1つの言葉として出てくる行だけ
+  //  （同志社生協の旅行の案内の本文の「フリープラン」、Joshin の件名の「SIMフリースマートフォン」を freee にしていた。
+  //    就活ニュースの「アクセンチュア 本選考 面接日程確定」は、件名にあるのでアクセンチュア）
+  if (own) {
+    const subj = companyKey(f.subject);
+    return rows.filter(row => [row.name].concat(row.aliases.filter(a => !a.includes('.'))).some(n => { const k = companyKey(n); return k.length >= 2 && wordIn(subj, k); }));
+  }
   // 3. 日程調整ツールなどから届いたメールは、件名・本文の最初に出てくる会社名で探す
   return rows.filter(row => {
     const rk = companyKey(row.name);
@@ -420,7 +483,7 @@ function searchTerms(rows) {
   for (const row of rows) {
     const name = normalize(row.name).replace(/株式会社|有限会社|合同会社|"/g, '').trim();
     if (name.length >= 2) terms.add('"' + name + '"');
-    for (const a of row.aliases) terms.add(a.includes('.') ? 'from:' + a : '"' + a.replace(/"/g, '') + '"');
+    for (const a of row.aliases.filter(a => !junkAlias(a))) terms.add(a.includes('.') ? 'from:' + a : '"' + a.replace(/"/g, '') + '"');
   }
   return [...terms];
 }
@@ -531,14 +594,21 @@ function* collectSteps(ss, rows, full, now, blocked) {
     return found.length;
   };
   // 就活サイト（会社名が出てくる宣伝が多い）からのメールは、検索の段階で除く（読む量が減って速くなる）
-  const noMedia = ' ' + JOB_MEDIA.concat((blocked || []).filter(b => b.includes('.'))).map(d => '-from:' + d).join(' ');
+  //  （最初から入れておく就活サイトは「読まない送信元」にも入っているので、同じものを2回書かない）
+  const noMedia = ' ' + [...new Set(JOB_MEDIA.concat((blocked || []).filter(b => b.includes('.'))))].map(d => '-from:' + d).join(' ');
+  // 会社名で探す。メールの多い会社があっても読み落とさないように、100スレッドずつ、見つかったぶんを全部（COMPANY_MAX_THREADS まで）読む
   const search = function* (list, days) {
     for (let i = 0; i < list.length; i += CONFIG.TERMS_PER_QUERY) {
-      yield* fetch('newer_than:' + days + 'd (' + list.slice(i, i + CONFIG.TERMS_PER_QUERY).join(' OR ') + ')' + noMedia, 0, CONFIG.THREADS_PER_QUERY);
+      const q = 'newer_than:' + days + 'd (' + list.slice(i, i + CONFIG.TERMS_PER_QUERY).join(' OR ') + ')' + noMedia;
+      for (let start = 0; start < CONFIG.COMPANY_MAX_THREADS; start += 100) {
+        if ((yield* fetch(q, start, 100)) < 100) break;
+      }
     }
   };
-  yield* search(oldTerms, recentDays);
-  yield* search(newTerms, CONFIG.DAYS);
+  // 前の版は1回の検索で50スレッドまでしか読まず、古いメールを読み落とすことがあった。一度だけ、全部の会社を DAYS 日ぶん探し直す
+  const paged = !!props.getProperty('COMPANY_PAGED_V1');
+  yield* search(paged ? oldTerms : [], recentDays);
+  yield* search(paged ? newTerms : terms, CONFIG.DAYS);
   // 表にない会社の選考メール（新しい会社の候補を出すため）。件名に選考の言葉があるメールを、就活サイトを除いて探す。
   // 数が多いので、100スレッドずつ CANDIDATE_MAX_THREADS まで読む
   const candidateDays = Math.min(incremental && props.getProperty('CANDIDATE_SEARCHED_V3') ? recentDays : CONFIG.CANDIDATE_DAYS, CONFIG.DAYS);
@@ -549,6 +619,7 @@ function* collectSteps(ss, rows, full, now, blocked) {
   writeCache(cache);
   // 途中でやめたときは「読み終わった」しるしを付けない（次の更新で、同じ範囲の残りを読む。読んだメールは保存済みなので速い）
   if (!stopped) {
+    props.setProperty('COMPANY_PAGED_V1', '1'); // 会社名の検索を、続きまで読むようにしてから探し直した
     props.setProperty('CANDIDATE_SEARCHED_V3', '1'); // 締切の言葉を足したので、V3（最初の1回は CANDIDATE_DAYS 日ぶん探す）
     props.setProperty('TERMS', JSON.stringify(terms));
   }
@@ -595,10 +666,13 @@ const INTERN_WORDS = /インターン|仕事体験|サマー|ウィンター|sum
 const HONSENKO_WORDS = /本選考|早期選考|新卒(採用)?選考|総合職[^。\n]{0,6}選考|\d{2}卒[^。\n]{0,10}選考/;
 
 // 選考の結果のメール
-// 通過（次の選考に進む）：これがあれば、お見送りとは読まない
-const PASS_WORDS = /(選考|面接|審査|書類|ES|エントリーシート|GD|ディスカッション).{0,8}(を)?(通過|合格)(され|し|とし|とな|とさ|いた|のお知らせ|のご連絡)|次(回|の)(選考|面接|ステップ)に(ぜひ)?(お)?進ん|お進みいただきたく|お進みいただけ|ご案内させていただきたく/i;
+// 通過の言葉（2つの決まりで同じものを使う。前は同じ文を2回書いていた）
+const PASS_CORE = '(選考|面接|審査|書類|ES|エントリーシート|GD|ディスカッション).{0,8}(を)?(通過|合格)(され|し|とし|とな|とさ|いた|のお知らせ|のご連絡)' +
+  '|次(回|の)(選考|面接|ステップ)に(ぜひ)?(お)?進ん|お進みいただきたく';
+// 通過（次の選考に進む）：これがあれば、お見送りとは読まない（広め：「お進みいただけ」「ご案内させていただきたく」も）
+const PASS_WORDS = new RegExp(PASS_CORE + '|お進みいただけ|ご案内させていただきたく', 'i');
 // 通過の連絡だとはっきりわかる言葉（日時のない通過の連絡を読むときに使う）
-const STRONG_PASS = /(選考|面接|審査|書類|ES|エントリーシート|GD|ディスカッション).{0,8}(を)?(通過|合格)(され|し|とし|とな|とさ|いた|のお知らせ|のご連絡)|次(回|の)(選考|面接|ステップ)に(ぜひ)?(お)?進ん|お進みいただきたく|選考の結果[^。\n]{0,20}次回[^。\n]{0,15}(ご案内|お進み)/i;
+const STRONG_PASS = new RegExp(PASS_CORE + '|選考の結果[^。\\n]{0,20}次回[^。\\n]{0,15}(ご案内|お進み)', 'i');
 // お見送り（不合格）。「見送りとさせていただく」（サイバーエージェント）・「お申し出をお断り申し上げる」（TalentX）も
 // （「開催を見送り」「キャンセルはお断りいたします」「満席のためご希望に添えず」はお見送りではないので入れない）
 const REJECT_WORDS = /ご希望に(は)?(沿|添)いかね|ご期待に(は)?(沿|添)いかね|貴意に(沿|添)いかね|見送らせていただ|お見送りさせていただ|お見送りとさせていただ|(?<!(開催|実施)を)見送りとさせていただ|お見送りすることと|採用を見送|ご縁がなかった|今回は.{0,15}(見送|叶わ|至りませんで)|ご期待に(お)?応えすることができ|(お申し出|ご応募|ご希望)を?お断り|お断り申し上げることと/;
@@ -770,12 +844,100 @@ function mailInfo(d) {
  * メール1通から「次の選考」と「日時・期限」を読み取る。読み取れなければ null。
  * type は 予定（日程が決まった）／締切（締切の案内）／提出済（提出・受検の確認）
  */
+// ----- 送信元ごとの読み方：日程調整ツール（eeasy・TimeRex）は、会社がちがっても同じひな形なので、決まった場所だけ読む -----
+// 読めなかったら undefined を返して、いつもの読み方にまかせる（ツールがひな形を変えたときなど）
+
+/** 日程調整ツールの「会社名 選考名」（「freee株式会社 一次面接」）を、会社名と選考名に分ける */
+function splitTitle(title) {
+  const t = normalize(title).trim();
+  const m = t.match(/^(\S*(?:株式会社|有限会社|合同会社)\S*|(?:株式会社|有限会社|合同会社)\s*\S+)\s*(.*)$/) || t.match(/^(\S+)\s+(.*)$/);
+  return m ? { company: m[1], what: m[2] } : { company: t, what: '' };
+}
+
+/** 日程調整ツールのメールを、決まった場所から読む */
+function readScheduler(d, base, subject, body, now) {
+  const tool = inDomains(base.sender, ['eeasy.jp']) ? 'eeasy' : inDomains(base.sender, ['timerex.net']) ? 'TimeRex' : '';
+  if (!tool) return undefined;
+  let company = '', what = '', line = '';
+  if (tool === 'eeasy') {
+    // 件名「日程確定 ＆ 連絡事項：freee株式会社 一次面接の日程調整 【eeasy】」・本文「◆freee株式会社 一次面接の日程調整」「日程：　11/16（月） 17:00～17:30」
+    const title = (body.match(/◆\s*([^\n]+?)の?日程調整/) || subject.match(/[：:]\s*([^【\n]+?)の?日程調整/) || [])[1];
+    if (!title) return undefined;
+    ({ company, what } = splitTitle(title));
+    line = (body.match(/日程\s*[：:]\s*([^\n]+)/) || [])[1] || (subject.match(/予定があります\s*[：:]\s*([^【\n]+)/) || [])[1] || '';
+  } else {
+    // 件名「平戸　野乃（クオンツ・コンサルティング人事）さんとの日程調整が完了しました」「クオンツ・コンサルティング 採用担当さんとの予定は明日です」
+    // 本文「日時：2026年11月18日 (水) 10:45 - 11:30（Asia/Tokyo）」
+    const who = (subject.match(/[（(]([^（）()]+)[）)]\s*さんとの/) || subject.match(/^(.+?)\s*さんとの/) || [])[1];
+    if (!who) return undefined;
+    company = normalize(who).replace(/\s*(採用担当|採用チーム|新卒採用|人事部|人事|採用)\s*$/, '').trim();
+    line = (body.match(/日時\s*[：:]\s*([^\n]+)/) || [])[1] || '';
+    what = (body.match(/\[カレンダーの招待\]\n件名:([^\n]*)/) || [])[1] || '';
+  }
+  if (!company) return undefined;
+  const info = { ...base, company, reason: tool + 'の' };
+  if (/キャンセル|取消|取り消し/.test(subject)) return { ...info, type: '取消', step: '', reason: info.reason + '予約のキャンセル' };
+  // 日程調整のお願い（まだ日時が決まっていない）
+  if (/日程調整のお願い|日程調整のご依頼|ご都合/.test(subject) && !/確定|完了|予定があります|明日/.test(subject)) {
+    const step = stepOf(what) || stepOf(subject);
+    return step && step !== 'ES' ? { ...info, type: '調整', slot: ADJUST, step, reason: info.reason + '日程調整のお願い' } : undefined;
+  }
+  const e = findEvents(line, d.date, false)[0];
+  if (!e) return undefined;
+  const meeting = meetingOf(what + '\n' + subject + '\n' + body.slice(0, 300));
+  if (meeting) return { ...info, type: '面談', step: '', what: meeting, when: e.start, end: e.end, reason: info.reason + meeting + 'の予約' };
+  const step = stepOf(what) || stepOf(subject) || stepOf(body.slice(0, 300));
+  if (!step || step === 'ES') return undefined;
+  return { ...info, type: '予定', slot: EVENT, step, when: e.start, reason: info.reason + (e.start > now ? '日程が決まった' : '日程が決まった（もう過ぎている）') };
+}
+
+/** カレンダーの招待（.ics）を、読みやすい文にする（ブラウザ版が本文の最初に足す。normalize のあとと同じ半角の記号で書く）。読めなければ空 */
+function icsText(ics) {
+  const t = String(ics || '').replace(/\r?\n[ \t]/g, ''); // 折り返した行をつなぐ
+  const ev = (t.match(/BEGIN:VEVENT([\s\S]*?)END:VEVENT/) || [])[1];
+  if (!ev) return '';
+  const get = k => (ev.match(new RegExp('^' + k + '(;[^:\\n]*)?:(.*)$', 'm')) || []);
+  const time = k => {
+    const m = get(k);
+    const v = (m[2] || '').trim().match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?(Z)?)?$/);
+    if (!v) return null;
+    // 終わりに Z があれば世界時（日本の時刻に直す）。なければ、その土地の時刻（日本の会社なので、そのまま）
+    return v[7] ? new Date(Date.UTC(+v[1], v[2] - 1, +v[3], +(v[4] || 0), +(v[5] || 0))) : new Date(+v[1], v[2] - 1, +v[3], +(v[4] || 0), +(v[5] || 0));
+  };
+  const s = time('DTSTART'), e = time('DTEND');
+  if (!s) return '';
+  const p2 = n => String(n).padStart(2, '0');
+  const fmt = x => x.getFullYear() + '年' + (x.getMonth() + 1) + '月' + x.getDate() + '日 ' + x.getHours() + ':' + p2(x.getMinutes());
+  const summary = (get('SUMMARY')[2] || '').replace(/\\([,;\\])/g, '$1').replace(/\\n/gi, ' ').trim();
+  const cancel = /METHOD:CANCEL/.test(t) || /STATUS:CANCELLED/.test(ev);
+  return '[カレンダーの招待]\n件名:' + summary + '\n日時:' + fmt(s) + (e ? '~' + e.getHours() + ':' + p2(e.getMinutes()) : '') + (cancel ? '\n状態:キャンセル' : '');
+}
+
+/** 本文の最初の「[カレンダーの招待]」（ブラウザ版が足したもの）から、予定を読む。どの送信元でも */
+function readInvite(d, base, subject, body, now) {
+  const m = body.match(/\[カレンダーの招待\]\n件名:([^\n]*)\n日時:([^\n]+)(\n状態:キャンセル)?/);
+  if (!m) return undefined;
+  if (m[3]) return { ...base, type: '取消', step: '', reason: 'カレンダーの招待のキャンセル' };
+  const e = findEvents(m[2], d.date, false)[0];
+  if (!e) return undefined;
+  const meeting = meetingOf(m[1] + '\n' + subject);
+  if (meeting) return { ...base, type: '面談', step: '', what: meeting, when: e.start, end: e.end, reason: 'カレンダーの招待（' + meeting + '）' };
+  const step = stepOf(m[1]) || stepOf(subject);
+  if (!step || step === 'ES') return undefined;
+  return { ...base, type: '予定', slot: EVENT, step, when: e.start, reason: 'カレンダーの招待' + (e.start > now ? '' : '（もう過ぎている）') };
+}
+
 function readMail(d, now) {
   const subject = d.subject, body = stripQuote(d.body); // 返信メールの引用部分（前のメールの文）は読まない
   const base = mailInfo(d);
   const sender = base.sender;
   // 就活サイトからのメールは宣伝が多いので読まない。キャンセルの連絡も読まない
   if (inDomains(sender, JOB_MEDIA)) return null;
+  // 日程調整ツール（eeasy・TimeRex）は決まった場所から、カレンダーの招待があればそこから読む（読めなければ、いつもの読み方）
+  const fixed = readScheduler(d, base, subject, body, now);
+  if (fixed !== undefined) return fixed;
+  const invite = readInvite(d, base, subject, body, now);
+  if (invite !== undefined) return invite;
   // 予約のキャンセルを受け付けた連絡：決まっていた日程を消す（次の予約まで、同じ選考の日程は未定）
   if (/キャンセル|取消|取り消し/.test(subject) && !/辞退/.test(subject) && /受け?付け?ました|完了|承りました/.test(subject + body.slice(0, 300))) {
     return { ...base, type: '取消', step: '', reason: '予約のキャンセル' };
@@ -851,7 +1013,8 @@ function readMail(d, now) {
   const nextGuide = head.match(/次の(ステップ|選考|段階)は[、,\s]*([^。\n]{1,20})/);
   if (nextGuide && !broadcast && !ENTRY_AD.test(subject) && /(ご)?提出(いただき|頂き|ありがとう)|(受付|受け付け)(いた|致)?しました|受領(いた|致)?しました/.test(head)) {
     const next = stepOf(nextGuide[2]);
-    if (next && next !== 'ES') return { ...base, type: '通過', slot: '', step: next, reason: '提出の確認（次は' + next + '）' };
+    // 「エントリー期間内にお済ませください」：締切は、前のメールのエントリーの締切（applyFindings で探す）
+    if (next && next !== 'ES') return { ...base, type: '通過', slot: '', step: next, withinEntry: /(エントリー|応募)(の)?(期間|期限|締切)(内|中|まで)/.test(body), reason: '提出の確認（次は' + next + '）' };
   }
   // 4. 通過の連絡で、日時・締切が書いていないもの（「一次面接は通過とし、次回は二次面接」）→ 次の選考だけ
   //    （「特別選考にご案内させていただきたく」のようなスカウトの宣伝は、通過の連絡とは読まない）
@@ -919,11 +1082,31 @@ const sameTime = (a, b) => (!a && !b) || (a instanceof Date && b instanceof Date
  *   - 前のシートから移した値より先の段階
  * それ以外（あなたが手で書いた内容と違う、どの行かわからない）は「確認待ち」へ
  */
-function applyFindings(ss, table, findings, now, unread, replies, appts) {
+function applyFindings(ss, table, findings, now, unread, replies, appts, pastFlow) {
+  const flow = pastFlow || [];
+  const ids = new Set(findings.map(f => f.id).filter(Boolean));
+  const oldEvents = flow.filter(e => !ids.has(e.mailId)); // 今回のメールと同じものは、今回読んだ内容で見る
+  // 流れの出来事と同じ会社か（会社名が同じ。メールが当てはまった行の名前でも見る）
+  const sameCompany = (f, e) => {
+    const keys = new Set([companyKey(cleanCompanyName(shortName(f.company)))].concat(rowsForMail(table.rows, f).map(r => companyKey(r.name))));
+    return keys.has(companyKey(e.name));
+  };
   const { sheet, cols, rows } = table;
   const review = readReview(ss);
   const trace = [];
   const note = (f, result, detail) => trace.push([f.date, f.company, f.subject, f.kind, result, detail]);
+  // 「Webテストはエントリー期間内に受けてください」（日本IBM）：締切は、同じ会社の前のメールにあるエントリー（ES）の締切
+  //  （このメールより前に届いた案内の締切で、このメールより後のもの。いちばん近いもの）
+  const companyTokens = f => candidateTokens(f).filter(t => /^(name|domain):/.test(t));
+  findings.forEach((f, i) => {
+    if (f.type !== '通過' || !f.withinEntry) return;
+    const ks = new Set(companyTokens(f));
+    const entryDl = g => g.type === '締切' && !g.meeting && (g.entry || SUBMIT_STEPS.includes(g.step)) && g.date <= f.date && g.when > f.date;
+    // 今回読んだメールと、前に読んだ出来事（メールが古くなって消えたもの）から
+    const dl = findings.filter(g => entryDl(g) && companyTokens(g).some(k => ks.has(k)))
+      .concat(oldEvents.filter(e => entryDl(e) && sameCompany(f, e))).sort((a, b) => a.when - b.when)[0];
+    if (dl) findings[i] = { ...f, type: '締切', slot: DEADLINE, when: dl.when, passed: true, reason: f.reason + '・締切はエントリーの締切 ' + show(dl.when) };
+  });
   let written = 0;
   const changed = new Set();
   const withMail = new Set(); // メールが1通でも見つかった行
@@ -966,7 +1149,7 @@ function applyFindings(ss, table, findings, now, unread, replies, appts) {
   /** 表の一番下に、その会社の行を足す（状況は選考中。別名には、送信元と、アドレスの中の会社名 freee・accenture など） */
   const addCompanyRow = (f, listName) => {
     const name = listName || cleanCompanyName(shortName(f.company)) || f.sender;
-    const extra = candidateTokens(f).filter(t => /^name:[a-z0-9-]{3,}$/.test(t)).map(t => t.slice(5)).filter(t => companyKey(t) !== companyKey(name));
+    const extra = candidateTokens(f).filter(t => /^name:[a-z0-9-]{3,}$/.test(t)).map(t => t.slice(5)).filter(t => companyKey(t) !== companyKey(name) && !junkAlias(t));
     const alias = [...new Set([candidateAlias(f, name)].concat(extra).filter(Boolean))].join(', ');
     const width = Math.max(...Object.values(cols));
     const values = Array(width).fill('');
@@ -984,6 +1167,10 @@ function applyFindings(ss, table, findings, now, unread, replies, appts) {
   const resultAt = new Map();
   findings.filter(f => f.type === '結果' && FINAL_STATES.includes(f.state))
     .forEach(f => rowsForMail(rows, f).forEach(r => resultAt.set(r, Math.max(resultAt.get(r) || 0, f.date.getTime()))));
+  // 前に読んだ結果の連絡（メールが古くなって消えたもの）も、選考の流れから
+  oldEvents.filter(e => e.type === '結果' && FINAL_STATES.includes(e.state)).forEach(e => rows
+    .filter(r => companyKey(r.name) === companyKey(e.name) && (e.kind === UNKNOWN_KIND || [e.kind, UNKNOWN_KIND].includes(kindGroup(r.kind))))
+    .forEach(r => resultAt.set(r, Math.max(resultAt.get(r) || 0, e.date.getTime()))));
   const endedAtOf = r => (r.owned && r.owned.endedAt) || resultAt.get(r) || 0;
 
   findings.slice().sort((a, b) => a.date - b.date).forEach(f => {
@@ -1560,11 +1747,11 @@ function candidateTokens(f) {
     const [local, host] = f.addr.split('@');
     const base = SHARED_DOMAINS.find(d => host === d || host.endsWith('.' + d)) || '';
     const sub = host.slice(0, Math.max(0, host.length - base.length - 1)).split('.')[0]; // freee.n-ats.hrmos.co → freee
-    const generic = /^(mail|info|no-?reply|noreply_tc|support|notice|notification|system|admin|contact|recruit|saiyo|jinji|candidate|n-ats|www|testcenter)$/;
-    if (sub && !generic.test(sub) && /^[a-z][a-z0-9-]{2,}$/.test(sub)) out.push('name:' + sub);
+    const generic = GENERIC_LOCAL;
+    if (sub && !generic.test(sub) && !junkAlias(sub) && /^[a-z][a-z0-9-]{2,}$/.test(sub)) out.push('name:' + sub);
     // jal_j@mail.axol.jp の jal（_ や . のあとは部署などの印）
     const head = (local || '').split(/[_.+]/)[0];
-    if (head && !generic.test(head) && /^[a-z][a-z0-9-]{2,}$/.test(head)) out.push('name:' + head);
+    if (head && !generic.test(head) && !junkAlias(head) && /^[a-z][a-z0-9-]{2,}$/.test(head)) out.push('name:' + head);
   }
   return out.length ? out : [f.sender];
 }
@@ -1591,7 +1778,7 @@ function candidateAlias(f, name) {
   if (!f.sender.includes('@') && !inDomains(f.sender, SHARED_DOMAINS)) return f.sender;
   // 日程調整ツールなどの共通のアドレス（info@eeasy.jp など）は、ほかの会社のメールにも当たるので書かない
   const local = f.addr.split('@')[0];
-  if (/^(info|no-?reply|support|notice|notification|system|mail|admin|contact|recruit)$/.test(local)) return '';
+  if (GENERIC_LOCAL.test(local)) return '';
   return f.addr && !FREE_MAIL.test(f.addr.split('@')[1] || '') ? f.addr : '';
 }
 
@@ -1653,25 +1840,13 @@ function writeCandidates(ss, found, now) {
   }
   for (const [key, x] of decided) if (!groups.has(key) && !adopted.has(key)) groups.set(key, x);
   const safe = v => (typeof v === 'string' && /^[=+\-@]/.test(v) ? "'" + v : v);
-  const rows = [...groups.values()].map(x => [x.key, safe(x.name), x.kind, x.sender, safe(x.subject), x.label, x.when || '', x.url, x.status, x.count, safe(x.alias), x.reopen || '',
+  // 残すのは、決めたもの（自動で追加・外した・無視・戻した）だけ。まだ決めていない候補（未確認）は、どこにも出さないので残さない
+  const rows = [...groups.values()].filter(x => x.status !== '未確認').map(x => [x.key, safe(x.name), x.kind, x.sender, safe(x.subject), x.label, x.when || '', x.url, x.status, x.count, safe(x.alias), x.reopen || '',
     x.decidedAt ? new Date(x.decidedAt) : '']);
   sheet.getRange(1, 1, 1, CANDIDATE_HEADER.length).setValues([CANDIDATE_HEADER]); // 前の形（列が少ない）のシートでも見出しをそろえる
   sheet.getRange(2, 1, Math.max(1, sheet.getLastRow() - 1), CANDIDATE_HEADER.length).clearContent();
   if (rows.length) sheet.getRange(2, 1, rows.length, CANDIDATE_HEADER.length).setValues(rows);
-  return [...groups.values()].filter(x => x.status === '未確認').length;
-}
-
-/** 画面の「新しい会社の候補」：追加（表に行を足して、すぐメールから更新）か無視 */
-function resolveCandidate(key, add) {
-  const ss = getSpreadsheet();
-  const { sheet, list } = readCandidates(ss);
-  const i = list.findIndex(x => x.key === key);
-  if (i < 0) return getData();
-  const x = list[i];
-  sheet.getRange(i + 2, CANDIDATE_HEADER.indexOf('状態') + 1).setValue(add ? '追加' : '無視');
-  sheet.getRange(i + 2, CANDIDATE_HEADER.indexOf('決めた日時') + 1).setValue(new Date());
-  if (add) addTableRow(ss, x.name, x.kind, x.alias);
-  return getData();
+  return [...groups.values()].filter(x => x.status === '自動で追加' && x.decidedAt === (now || new Date()).getTime()).length; // 今回自動で入れた会社の数
 }
 
 // ----- 日程未定タブの「非表示」：その会社のその選考を、日程未定に出さない（次の選考が変わったら、また出す）。「戻す」で出す -----
@@ -1708,7 +1883,7 @@ function removeAutoAdded(key) {
   const table = readTable(ss);
   table.rows.filter(r => companyKey(r.name) === companyKey(x.name) && !(x.reopen && FINAL_STATES.includes(r.state)))
     .sort((a, b) => b.r - a.r).forEach(r => table.sheet.deleteRow(r.r));
-  if (!x.reopen) deleteHistory(ss, x.name); // 関係ない会社だったので、カレンダーの記録も消す
+  if (!x.reopen) { deleteHistory(ss, x.name); deleteFlow(ss, x.name); } // 関係ない会社だったので、カレンダーの記録と選考の流れも消す
   return getData();
 }
 
@@ -2031,6 +2206,73 @@ function resolveDeadline(key, action) {
   return getData();
 }
 
+// ===== 選考の流れ：メールから読んだ出来事（予定・締切・通過・提出・結果・日程調整・キャンセル・面談）を、会社ごとに全部残す =====
+// 読み込み済みメールは DAYS 日で消えるが、流れは残る。メールをまたぐ判断（選考が終わった日・通過したか・エントリーの締切など）は、ここから見る。
+// 会社は、そのとき当てはまった会社一覧の行の名前（行がなければメールの会社名）。同じメールをまた読んだら、新しい行の名前に直す
+
+const FLOW_HEADER = ['id', '会社', '選考種別', 'メールの日時', '何', '段階', '日時', '結果', 'メール', 'しるし', 'ドメイン'];
+
+function readFlow(ss) {
+  const sheet = sheetWithHeader(ss, CONFIG.FLOW_SHEET, FLOW_HEADER);
+  const list = sheet.getDataRange().getValues().slice(1).filter(r => r[0]).map(r => ({
+    id: String(r[0]), name: String(r[1]), kind: String(r[2]), date: Number(r[3]), type: String(r[4]), step: String(r[5] || ''),
+    when: Number(r[6] || 0), state: String(r[7] || ''), mail: String(r[8] || ''), flags: String(r[9] || ''), domain: String(r[10] || ''),
+  }));
+  return { sheet, list };
+}
+
+function saveFlow(sheet, list) {
+  const safe = v => (typeof v === 'string' && /^[=+\-@]/.test(v) ? "'" + v : v);
+  const rows = list.slice().sort((a, b) => a.date - b.date).slice(-CONFIG.FLOW_MAX)
+    .map(x => [x.id, safe(x.name), x.kind, x.date, x.type, x.step, x.when || '', x.state, x.mail, x.flags, x.domain || '']);
+  const old = sheet.getLastRow() - 1;
+  sheet.getRange(1, 1, 1, FLOW_HEADER.length).setValues([FLOW_HEADER]); // 前の版の見出し（ドメインの列がない）も直す
+  if (old > 0) sheet.getRange(2, 1, old, FLOW_HEADER.length).clearContent();
+  if (rows.length) sheet.getRange(2, 1, rows.length, FLOW_HEADER.length).setValues(rows);
+}
+
+/** 今回読んだメールの出来事を流れに足す（同じメールは置きかえ）。返り値は流れ全部 */
+function writeFlow(ss, table, findings, appts) {
+  const { sheet, list } = readFlow(ss);
+  const before = JSON.stringify(list);
+  const byId = new Map(list.map(x => [x.id, x]));
+  for (const f of findings.concat(appts || [])) {
+    if (!f.id || !f.date) continue;
+    const rs = rowsForMail(table.rows, f);
+    const same = rs.filter(r => kindGroup(r.kind) === f.kind);
+    const r = (same.length ? same : rs)[0] || null;
+    const name = r ? r.name : cleanCompanyName(shortName(f.company)) || f.sender;
+    const ev = { id: f.id + '|' + f.type, name, kind: kindGroup(r ? r.kind : f.kind),
+      date: f.date.getTime(), type: f.type, step: (f.type === '面談' ? f.what : f.step) || '', when: f.when ? f.when.getTime() : 0,
+      state: f.state || '', mail: f.url || '', flags: [f.entry && 'entry', f.passed && 'passed', f.meeting && 'meeting'].filter(Boolean).join(','),
+      // 会社自身のドメイン（どのドメインがどの会社かを覚えるため）。会社名がわからないメール（送信元しかない）は覚えない
+      domain: name && !companyKey(name).includes('.') && !companyKey(name).includes('@') ? ownDomain(f.sender) : '' };
+    byId.set(ev.id, ev);
+  }
+  const out = [...byId.values()].sort((a, b) => a.date - b.date);
+  if (JSON.stringify(out) !== before) saveFlow(sheet, out);
+  return out;
+}
+
+/** 流れの出来事を、メールから読んだ内容と同じ形にする（Date に戻す） */
+const flowEvent = e => ({ mailId: e.id.split('|')[0], type: e.type, step: e.type === '面談' ? '' : e.step, what: e.type === '面談' ? e.step : '', when: e.when ? new Date(e.when) : null,
+  date: new Date(e.date), url: e.mail, state: e.state, passed: /passed/.test(e.flags), entry: /entry/.test(e.flags), meeting: /meeting/.test(e.flags), name: e.name, kind: e.kind });
+
+/** 流れの出来事の会社に当たる、会社一覧の行（同じ選考種別があればそれ） */
+function flowRow(rows, e) {
+  const rs = rows.filter(r => companyKey(r.name) === companyKey(e.name));
+  const same = rs.filter(r => kindGroup(r.kind) === e.kind);
+  return (same.length ? same : rs)[0] || null;
+}
+
+/** 会社を非表示にしたとき：その会社の流れも消す */
+function deleteFlow(ss, name) {
+  if (!ss.getSheetByName(CONFIG.FLOW_SHEET)) return;
+  const { sheet, list } = readFlow(ss);
+  const keep = list.filter(e => companyKey(e.name) !== companyKey(name));
+  if (keep.length !== list.length) saveFlow(sheet, keep);
+}
+
 // ===== 予定の記録：過ぎた面接・GD・面談・ESの提出などを1行ずつ残す（カレンダーの過ぎた日に出す） =====
 // 会社一覧の行は、選考が進むと前の日時が消えるので、ここに残す。結果のメールが来たら「通過」「NG」なども書き足す。
 // メールが古くなって読み込み済みから消えても、記録は残る。HISTORY_MAX を超えたら古いものから消す
@@ -2063,8 +2305,12 @@ function saveHistory(sheet, list) {
  * 同じ会社・同じ選考種別・同じこと（1次面接など）で日付が45日以内なら同じ予定（日程の変更は新しい日付に直す）。離れていれば別の選考の予定。
  * そのあと、通過・お見送り・内定などのメールで、その前のいちばん近い記録に結果を書く
  */
-function writeHistory(ss, table, findings, appts, now) {
+function writeHistory(ss, table, flow, now) {
   const { sheet, list } = readHistory(ss);
+  // もとは選考の流れ（メールが古くなって消えても、前に読んだ出来事から記録と通過がわかる）
+  const events = flow.map(flowEvent);
+  const findings = events.filter(e => e.type !== '面談');
+  const appts = events.filter(e => e.type === '面談');
   const before = JSON.stringify(list);
   // 同じ会社（「株式会社」の有無などはちがっても）・同じ日時の記録は1つだけ（前の版で2つできたものは、結果があるほうを残す）
   const atKey = h => companyKey(h.name) + '|' + h.date;
@@ -2083,12 +2329,8 @@ function writeHistory(ss, table, findings, appts, now) {
     const key = list.some(h => h.key === base) ? base + '#' + d.getFullYear() + String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0') : base;
     list.push({ key, date: x.date, name: x.name, kind: x.kind, what: x.what, type: x.type, result: '', resultAt: 0, mail: x.mail || '' });
   };
-  // メールの会社の、会社一覧の行（同じ選考種別の行があればそれ）
-  const rowOf = f => {
-    const rs = rowsForMail(table.rows, f);
-    const same = rs.filter(r => kindGroup(r.kind) === f.kind);
-    return (same.length ? same : rs)[0] || null;
-  };
+  // 出来事の会社の、会社一覧の行（同じ選考種別の行があればそれ）
+  const rowOf = f => flowRow(table.rows, f);
   const sorted = findings.slice().sort((a, b) => a.date - b.date);
   // キャンセルした予定：予定のメールのあと、その日時より前に、同じ会社のキャンセルの連絡が来たもの。記録にしない（前の版で入った記録も消す）
   const cancels = sorted.filter(f => f.type === '取消');
@@ -2107,7 +2349,7 @@ function writeHistory(ss, table, findings, appts, now) {
   for (const a of appts || []) {
     if (!a.when || a.when.getTime() >= t) continue;
     const r = rowOf(a);
-    put({ name: r ? r.name : cleanCompanyName(shortName(a.company)) || a.sender, kind: r ? kindGroup(r.kind) : kindGroup(a.kind), what: a.what || '面談', type: '面談', date: a.when.getTime(), mail: a.url });
+    put({ name: r ? r.name : a.name, kind: r ? kindGroup(r.kind) : a.kind, what: a.what || '面談', type: '面談', date: a.when.getTime(), mail: a.url });
   }
   for (const r of table.rows) {
     const kind = kindGroup(r.kind);
@@ -2276,6 +2518,17 @@ function update(full) {
   const ss = getSpreadsheet();
   const now = new Date();
   const table = readTable(ss);
+  // 前の版が自動で入れた、意味のない別名（da2l1gd7lf9ugvhul560・mbox-bgeqnk・ats など）を消す（検索の言葉にもなっていた）
+  if (table.cols.alias) {
+    for (const row of table.rows) {
+      const parts = row.alias.split(/[,、\s]+/).map(s => s.trim()).filter(Boolean);
+      const keep = parts.filter(a => !junkAlias(a));
+      if (keep.length === parts.length) continue;
+      row.alias = keep.join(', ');
+      row.aliases = keep.map(s => s.toLowerCase());
+      table.sheet.getRange(row.r, table.cols.alias).setValue(row.alias);
+    }
+  }
   // 「次の選考」「締切/日程」の選択肢をそろえる（前に作った表には「1次選考」「日程調整」「確定待ち」などがないため）
   const n = Math.max(table.sheet.getMaxRows() - 1, 1);
   const list = l => SpreadsheetApp.newDataValidation().requireValueInList(l, true).setAllowInvalid(true).build();
@@ -2314,11 +2567,17 @@ function update(full) {
     tasksOf(d).forEach(t => tasks.push(t));
     receiptsOf(d).forEach(r => receipts.push(r));
   }
-  const result = applyFindings(ss, table, findings, now, unread, replies, appts);
+  // 前に読んだ出来事（選考の流れ）：メールが古くなって消えても、選考が終わった日・エントリーの締切などがわかる
+  const flowList = readFlow(ss).list;
+  // どのドメインがどの会社か（前に読んだメールと、会社一覧の別名から）。会社自身のドメインのメールは、これで会社を決める
+  learnDomains(table.rows, flowList);
+  const pastFlow = flowList.map(flowEvent);
+  const result = applyFindings(ss, table, findings, now, unread, replies, appts, pastFlow);
   // やること（履歴書の提出など）は、表を書いたあとに（面接の日時から期限を計算するため）
   result.tasks = applyTasks(ss, table, tasks, receipts, myMails, now);
-  // 過ぎた予定・提出と、その結果を記録に残す（会社一覧を書いたあとの行から）
-  writeHistory(ss, readTable(ss), findings, appts, now);
+  // 今回読んだ出来事を流れに足して（会社一覧を書いたあとの行の名前で）、過ぎた予定・提出とその結果を記録に残す
+  const after = readTable(ss);
+  writeHistory(ss, after, writeFlow(ss, after, findings, appts), now);
   // 途中でやめたときは前回の更新の日時のままにして、次の更新で同じ範囲の残りを読む
   if (!stopped) PropertiesService.getUserProperties().setProperty('LAST_RUN', String(now.getTime()));
   result.stopped = stopped;
@@ -2387,9 +2646,10 @@ function getData() {
     id: x.id, company: x.company, rows: x.rows, step: x.step, slot: x.slot, label: stepLabel(x.step, x.slot),
     when: x.when ? x.when.toISOString() : null, state: x.state, reason: x.reason, url: x.url,
   })) : [];
-  // 候補：まだ決めていないもの（未確認）と、自動で表に入れた会社（入れてから2週間。間違っていたら「表から外す」）
+
+  // 最近（2週間以内に）自動で会社一覧に入れた会社（候補タブはなくしたので、まだ決めていない候補はない）
   const candidates = ss.getSheetByName(CONFIG.CANDIDATE_SHEET) ? readCandidates(ss).list
-    .filter(x => x.status === '未確認' || (x.status === '自動で追加' && now.getTime() - x.decidedAt < 14 * 864e5)).map(x => ({
+    .filter(x => x.status === '自動で追加' && now.getTime() - x.decidedAt < 14 * 864e5).map(x => ({
       key: x.key, name: x.name, kind: x.kind, label: x.label, when: x.when ? x.when.toISOString() : null, subject: x.subject, url: x.url, count: x.count, reopen: x.reopen,
       auto: x.status === '自動で追加',
     })) : [];
@@ -2629,6 +2889,10 @@ const PAGE_HTML = String.raw`<!DOCTYPE html>
   .chip.ev { background: var(--blue-bg); color: var(--blue); }
   /* 締切まとめ（表にない会社の締切）：表の会社の締切より控えめに、点線の枠 */
   .chip.dl2 { background: transparent; color: var(--red); border: 1px dashed var(--red); }
+  /* やること・待っているタブの中の区切り（確認してほしいこと／自分がやること／一覧にない会社の締切 など） */
+  .sec-box + .sec-box { margin-top: 18px; }
+  .sec-box[hidden] + .sec-box { margin-top: 0; }
+  .sec-head { font-weight: bold; font-size: 14px; padding: 2px 0 6px; border-bottom: 2px solid var(--line); }
   .dl-sum { font-weight: bold; padding: 10px 0 2px; }
   .dl-sum.soon { color: var(--red); }
   .sec { font-size: 12px; color: var(--muted); padding: 10px 0 0; border-bottom: 1px solid var(--line); }
@@ -2803,7 +3067,7 @@ const PAGE_HTML = String.raw`<!DOCTYPE html>
     </section>
     <section>
       <b>データの書き出し・読み込み</b>
-      <div class="why">会社一覧・タスク・締切まとめなどを1つのファイルにして、手元に保存できます。別の端末や、もう一方の版（Apps Script 版・ブラウザ版）に移すときは、そのファイルを読み込みます。読み込み済みのメールは入らないので、読み込んだあとの更新で、メールを読み直します。</div>
+      <div class="why">会社一覧・やること・締切などを1つのファイルにして、手元に保存できます。別の端末や、もう一方の版（Apps Script 版・ブラウザ版）に移すときは、そのファイルを読み込みます。読み込み済みのメールは入らないので、読み込んだあとの更新で、メールを読み直します。</div>
       <div class="actions"><button id="export">書き出す</button><button id="import">読み込む</button><input type="file" id="import-file" accept=".json,application/json" hidden></div>
     </section>
   </div>
@@ -2821,34 +3085,37 @@ const PAGE_HTML = String.raw`<!DOCTYPE html>
         <button id="next" aria-label="次の月">&gt;</button>
       </div>
       <div class="grid" id="grid"></div>
-      <div class="legend"><span><span class="chip dl">タスク</span>期限までに自分がやる（ESの提出・面接の予約・提出物）</span><span><span class="chip ev">予定</span>その日時に参加する（面接・GD・面談）</span><span><span class="chip dl2">締切まとめ</span>一覧にない会社の締切</span></div>
+      <div class="legend"><span><span class="chip dl">やること</span>期限までに自分がやる（ESの提出・面接の予約・提出物）</span><span><span class="chip ev">予定</span>その日時に参加する（面接・GD・面談）</span><span><span class="chip dl2">一覧にない会社</span>一覧にない会社の締切</span></div>
       <h2 id="day-title"></h2>
       <div class="card" id="day-list"></div>
       <div class="add-task">
-        <b id="add-title">この日にタスクを追加</b>
+        <b id="add-title">この日にやることを追加</b>
         <select id="task-company" aria-label="会社"><option value="">（会社なし）</option></select>
-        <input id="task-what" placeholder="例：履歴書を書く" aria-label="タスク">
+        <input id="task-what" placeholder="例：履歴書を書く" aria-label="やること">
         <input id="task-time" type="time" value="23:59" aria-label="時刻">
         <button id="task-add">追加</button>
       </div>
     </div>
     <div class="side">
       <div class="tabs" role="tablist">
-        <button role="tab" data-pane="todo">タスク<span class="cnt" id="cnt-todo"></span></button>
-        <button role="tab" data-pane="dls">締切まとめ<span class="cnt" id="cnt-dls"></span></button>
+        <button role="tab" data-pane="todo">やること<span class="cnt" id="cnt-todo"></span></button>
         <button role="tab" data-pane="plans">予定<span class="cnt" id="cnt-plans"></span></button>
-        <button role="tab" data-pane="undecided">日程未定<span class="cnt" id="cnt-undecided"></span></button>
-        <button role="tab" data-pane="waiting">結果待ち<span class="cnt" id="cnt-waiting"></span></button>
-        <button role="tab" data-pane="reviews">確認待ち<span class="cnt" id="cnt-reviews"></span></button>
+        <button role="tab" data-pane="waiting">待っている<span class="cnt" id="cnt-waiting"></span></button>
         <button role="tab" data-pane="companies">会社</button>
         <button role="tab" data-pane="stats">数字</button>
       </div>
-      <div class="pane card" id="todo"></div>
-      <div class="pane card" id="dls" hidden></div>
+      <!-- やること：確認してほしいこと・自分がやること・一覧にない会社の締切 -->
+      <div class="pane card" id="todo">
+        <div class="sec-box" id="rv-box"><div class="sec-head">確認してほしいこと</div><div id="reviews"></div></div>
+        <div class="sec-box"><div class="sec-head">自分がやること</div><div id="todo-list"></div></div>
+        <div class="sec-box"><div class="sec-head">一覧にない会社の締切</div><div id="dls"></div></div>
+      </div>
       <div class="pane card" id="plans" hidden></div>
-      <div class="pane card" id="undecided" hidden></div>
-      <div class="pane card" id="waiting" hidden></div>
-      <div class="pane card" id="reviews" hidden></div>
+      <!-- 待っている：結果待ちと、会社からの日程の連絡待ち -->
+      <div class="pane card" id="waiting" hidden>
+        <div class="sec-box"><div class="sec-head">結果待ち</div><div id="waiting-list"></div></div>
+        <div class="sec-box"><div class="sec-head">会社からの日程の連絡待ち</div><div id="undecided"></div></div>
+      </div>
       <div class="pane card" id="companies" hidden>
         <div class="co-tools">
           <div class="fchips" id="cf-state"></div>
@@ -2996,6 +3263,15 @@ function dlItem(x, g) {
   return box;
 }
 
+/** 日時がまだの選考の行に「非表示」を付ける（設定の「非表示にしたもの」と、待っているタブの下から戻せる。次の選考が変わると、また出る） */
+function withHide(it, x) {
+  const hide = el('button', 'hide-btn', '非表示');
+  hide.title = 'この会社を出さない（「待っている」の下の「非表示にした会社」から戻せます。次の選考が変わると、また出ます）';
+  hide.onclick = e => { e.stopPropagation(); call('hideUndecided', [x.key, x.step], x.name + 'を非表示にしました', hide); };
+  it.append(hide);
+  return it;
+}
+
 function row(x, withDate) {
   const it = tappable(el('div', 'item' + (!x.when && x.slot === '日程調整' ? ' adjust' : '')), x);
   if (withDate) {
@@ -3104,28 +3380,23 @@ function render() {
   //  日程調整が必要な選考（面接の予約がまだ・候補日の返信がまだ）も、自分がやることなのでタスクに出す（期限はないので下のほう）
   const todo = DATA.upcoming.filter(x => x.slot === '締切')
     .concat((DATA.tasks || []).filter(x => !x.hold).map(x => Object.assign({ task: true }, x)))
-    .concat(DATA.undecided.filter(x => x.slot === '日程調整').map(x => Object.assign({}, x, { label: x.step + 'の予約（日程を決める）' })))
+    .concat(DATA.undecided.filter(x => x.slot === '日程調整').map(x => Object.assign({ adjust: true }, x, { label: x.step + 'の予約（日程を決める）' })))
     .sort(byWhen);
-  const td = $('todo'); td.replaceChildren();
-  todo.forEach(x => td.append(x.task ? taskRow(x) : row(x, !!x.when)));
+  const td = $('todo-list'); td.replaceChildren();
+  todo.forEach(x => td.append(x.task ? taskRow(x) : x.adjust ? withHide(row(x, false), x) : row(x, !!x.when)));
   if (!todo.length) td.append(el('div', 'empty', 'ありません'));
   // 予定（その日時に参加する）：面接・GDなどの日程と、面談など
   const plans = DATA.upcoming.filter(x => x.slot !== '締切').concat(DATA.appts || []).sort(byWhen);
   const pl = $('plans'); pl.replaceChildren();
   plans.forEach(x => pl.append(x.appt ? apptRow(x) : row(x, true)));
   if (!plans.length) pl.append(el('div', 'empty', 'ありません'));
-  // 日程未定：行ごとに「非表示」。隠した会社は下の「非表示にした会社」に出して、「戻す」で戻せる
+  // 会社からの日程の連絡待ち（次の選考は決まったが日時がまだで、あなたが日程を返す番ではないもの）：行ごとに「非表示」。
+  // 隠した会社は下の「非表示にした会社」に出して、「戻す」で戻せる（日程を決める番の会社は「やること」に出る）
   const un = $('undecided'); un.replaceChildren();
-  DATA.undecided.forEach(x => {
-    const it = row(x, false);
-    const hide = el('button', 'hide-btn', '非表示');
-    hide.title = 'この会社を日程未定に出さない（下の「非表示にした会社」から戻せます。次の選考が変わると、また出ます）';
-    hide.onclick = () => call('hideUndecided', [x.key, x.step], x.name + 'を非表示にしました', hide);
-    it.append(hide);
-    un.append(it);
-  });
+  const waitDate = DATA.undecided.filter(x => x.slot !== '日程調整');
+  waitDate.forEach(x => un.append(withHide(row(x, false), x)));
   const hid = DATA.undecidedHidden || [];
-  if (!DATA.undecided.length) un.append(el('div', 'empty', hid.length ? 'ありません（ほかは非表示にした会社です）' : 'ありません'));
+  if (!waitDate.length) un.append(el('div', 'empty', hid.length ? 'ありません（ほかは非表示にした会社です）' : 'ありません'));
   if (hid.length) {
     const det = el('details', 'hidden-list');
     det.open = HIDDEN_OPEN;
@@ -3136,13 +3407,13 @@ function render() {
       const name = el('span', null, x.name + (x.label ? '：' + x.label : ''));
       name.append(el('small', null, fmt(x.hiddenAt).replace(/ .*$/, '') + 'に非表示'));
       const back = el('button', null, '戻す');
-      back.onclick = () => call('unhideUndecided', [x.key], x.name + 'を日程未定に戻しました', back);
+      back.onclick = () => call('unhideUndecided', [x.key], x.name + 'を戻しました', back);
       line.append(name, back);
       det.append(line);
     });
     un.append(det);
   }
-  const wt = $('waiting'); wt.replaceChildren();
+  const wt = $('waiting-list'); wt.replaceChildren();
   (DATA.waiting || []).forEach(x => wt.append(row(x, false)));
   if (!(DATA.waiting || []).length) wt.append(el('div', 'empty', 'ありません'));
 
@@ -3185,7 +3456,8 @@ function render() {
     box.append(actions);
     rv.append(box);
   }
-  if (!DATA.reviews.length) rv.append(el('div', 'empty', 'ありません'));
+  // 確認してほしいことがないときは、見出しごと出さない
+  $('rv-box').hidden = !DATA.reviews.length;
 
   // タブの件数（確認待ちは、あれば赤で目立たせる）
   // 日程調整が必要な行（あなたが動く番）：画面の上に赤い帯で出す
@@ -3199,14 +3471,14 @@ function render() {
   $('clash-title').textContent = '予定が近い・重なっている（' + clashes.length + '件）';
   $('clash-names').textContent = clashes.map(c => c.names.join(' と ') + '（' + fmt(c.when) + '）').join('、');
   renderStats();
-  const counts = { todo: todo.length, dls: dls.length, plans: plans.length, undecided: DATA.undecided.length, waiting: (DATA.waiting || []).length, reviews: DATA.reviews.length };
+  // タブの件数。やることは、確認してほしいこと・期限が近い（過ぎた・未定の）もの・近い締切があれば赤。待っているは、長く待っていれば赤
+  const counts = { todo: todo.length + dls.length + DATA.reviews.length, plans: plans.length, waiting: (DATA.waiting || []).length + waitDate.length };
+  const soon = DATA.reviews.length || todo.some(x => !x.when || daysLeft(x.when) <= DATA.warnDays) || dls.some(x => daysLeft(x.when) <= DATA.warnDays);
+  const alert = { todo: soon, plans: false, waiting: (DATA.waiting || []).some(x => x.waitDays != null && x.waitDays >= (DATA.waitWarnDays || 14)) };
   for (const k in counts) {
     const c = $('cnt-' + k);
     c.textContent = counts[k] ? counts[k] : '';
-    // やることは、期限が近い（または過ぎた・未定の）ものがあれば赤
-    const soon = todo.some(x => !x.when || daysLeft(x.when) <= DATA.warnDays);
-    c.className = 'cnt' + (((k === 'reviews' && counts[k])) || (k === 'undecided' && adjust.length) || (k === 'todo' && soon) || (k === 'dls' && dls.some(x => daysLeft(x.when) <= DATA.warnDays)) ||
-      (k === 'waiting' && (DATA.waiting || []).some(x => x.waitDays != null && x.waitDays >= (DATA.waitWarnDays || 14))) ? ' alert' : '');
+    c.className = 'cnt' + (alert[k] ? ' alert' : '');
   }
   renderCompanies();
   if (!$('settings').hidden) renderSettings();
@@ -3231,7 +3503,7 @@ function renderTopStats() {
   item('参加決定', s.byState['インターン参加決定'] || 0);
   item('NG', s.byState['NG'] || 0);
   item('通過率', s.decided ? Math.round(s.passed / s.decided * 100) + '%' : '−', 'rate');
-  item('締切まとめ', (s.deadlineCompanies || 0) + '社');
+  item('一覧にない会社の締切', (s.deadlineCompanies || 0) + '社');
 }
 function renderStats() {
   renderTopStats();
@@ -3270,7 +3542,7 @@ function renderStats() {
   const b3 = block('結果が出た選考の通過率');
   b3.append(el('div', 'st-rate', s.decided ? Math.round(s.passed / s.decided * 100) + '%' : '−'),
     el('div', 'why', s.decided ? '内定・インターン参加決定 ' + s.passed + '件 ÷（それと NG を合わせた ' + s.decided + '件）。辞退は数えません' : 'まだ結果が出た選考はありません'));
-  block('締切まとめ（一覧にない会社）：' + (s.deadlineCompanies || 0) + '社');
+  block('一覧にない会社の締切：' + (s.deadlineCompanies || 0) + '社');
   // 月ごとのまとめ（予定の記録から）：その月にした選考・提出・面談と、その月に来た結果
   const b4 = block('月ごとのまとめ');
   const tb = el('table', 'st-months');
@@ -3288,7 +3560,9 @@ function renderStats() {
 // ----- 右の欄のタブ（最後に見たタブを覚えておく） -----
 let PANE = 'todo';
 try { PANE = localStorage.getItem('pane') || 'todo'; } catch (e) { PANE = 'todo'; }
-if (!['todo', 'dls', 'plans', 'undecided', 'waiting', 'reviews', 'companies', 'stats'].includes(PANE)) PANE = 'todo'; // 前の版のタブ名（なくした候補タブなど）なら「タスク」
+// 前の版のタブ（締切まとめ・確認待ちは「やること」、日程未定・結果待ちは「待っている」になった。なくした候補タブなども）
+PANE = { dls: 'todo', reviews: 'todo', undecided: 'waiting' }[PANE] || PANE;
+if (!['todo', 'plans', 'waiting', 'companies', 'stats'].includes(PANE)) PANE = 'todo';
 function showPane(p) {
   PANE = p;
   try { localStorage.setItem('pane', p); } catch (e) { /* 覚えられなくても動く */ }
@@ -3301,7 +3575,7 @@ function showPane(p) {
 }
 document.querySelectorAll('.tabs button').forEach(b => { b.onclick = () => showPane(b.dataset.pane); });
 // 赤い帯の「見る」：日程未定タブを開く（スマホでは欄まで下がる）
-$('adjust-go').onclick = () => { showPane('undecided'); document.querySelector('.side').scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+$('adjust-go').onclick = () => { showPane('todo'); document.querySelector('.side').scrollIntoView({ behavior: 'smooth', block: 'start' }); };
 $('clash-go').onclick = () => { showPane('plans'); document.querySelector('.side').scrollIntoView({ behavior: 'smooth', block: 'start' }); };
 
 // ----- 月のカレンダー -----
@@ -3322,12 +3596,12 @@ $('this-month').onclick = () => { CAL = new Date(); CAL.setDate(1); CAL.setHours
 // やることを足す：選んだ日 ＋ 時刻
 function addTaskFromCal() {
   const what = $('task-what').value.trim();
-  if (!what) { $('task-what').focus(); toast('タスクの内容を書いてください', true); return; }
+  if (!what) { $('task-what').focus(); toast('やることの内容を書いてください', true); return; }
   const [y, m, d] = PICK.split('-').map(Number);
   const [hh, mm] = ($('task-time').value || '23:59').split(':').map(Number);
   const due = new Date(y, m - 1, d, hh, mm);
   $('task-what').value = '';
-  call('addTask', [$('task-company').value, what, due.toISOString()], 'タスクを追加しました', $('task-add'));
+  call('addTask', [$('task-company').value, what, due.toISOString()], 'やることを追加しました', $('task-add'));
 }
 $('task-add').onclick = addTaskFromCal;
 $('task-what').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) addTaskFromCal(); };
@@ -3341,10 +3615,10 @@ function showPop(x, anchor) {
   close.onclick = hidePop;
   // 内定・NGなど選考が終わった会社の行は、「結果待ち」などではなく、その状況を出す
   const ended = !x.task && !x.appt && !x.hist && ['内定', 'インターン参加決定', 'NG', '辞退'].includes(x.state);
-  const kind = x.hist ? '過ぎた予定の記録（' + (x.type === '提出' ? '提出' : x.type === '面談' ? '選考外' : '選考') + '）' : x.task ? 'タスク（' + (x.manual ? '自分で追加' : '会社からの依頼') + '）'
+  const kind = x.hist ? '過ぎた予定の記録（' + (x.type === '提出' ? '提出' : x.type === '面談' ? '選考外' : '選考') + '）' : x.task ? 'やること（' + (x.manual ? '自分で追加' : '会社からの依頼') + '）'
     : ended ? '選考が終わった会社'
-    : x.step === '結果待ち' ? '結果待ち' : !x.when && !x.appt ? (x.slot === '日程調整' ? '日程未定（日程調整が必要）' : x.slot === '確定待ち' ? '日程未定（確定待ち）' : '日程未定')
-    : x.appt ? '予定（選考外）' : x.slot === '締切' ? 'タスク（選考）' : '予定（選考）';
+    : x.step === '結果待ち' ? '結果待ち' : !x.when && !x.appt ? (x.slot === '日程調整' ? '日程を決める（あなたの番）' : x.slot === '確定待ち' ? '会社からの日程の連絡待ち（返信済み）' : '会社からの日程の連絡待ち')
+    : x.appt ? '予定（選考外）' : x.slot === '締切' ? 'やること（選考）' : '予定（選考）';
   const what = x.task ? (x.detail || x.what) : x.appt || x.hist ? x.what : ended ? x.state : x.waitFor ? x.waitFor + 'の結果待ち' : x.label;
   const end = x.end ? '〜' + new Date(x.end).getHours() + ':' + pad(new Date(x.end).getMinutes()) : '';
   const dl = el('dl');
@@ -3447,7 +3721,7 @@ function renderCal() {
   items.forEach(x => list.append(x.ext ? dlRow(x) : x.task ? taskRow(x) : x.hist ? histRow(x) : x.appt ? apptRow(x) : row(x, new Date(x.when) >= new Date(new Date().setHours(0, 0, 0, 0)))));
   if (!items.length) list.append(el('div', 'empty', 'ありません'));
   // やることを足す欄：選んだ日の日付と、会社の選択肢
-  $('add-title').textContent = (pick.getMonth() + 1) + '/' + pick.getDate() + '(' + DOW[pick.getDay()] + ') にタスクを追加';
+  $('add-title').textContent = (pick.getMonth() + 1) + '/' + pick.getDate() + '(' + DOW[pick.getDay()] + ') にやることを追加';
   const sel = $('task-company'), keep = sel.value;
   sel.replaceChildren(el('option', null, '（会社なし）'));
   sel.firstChild.value = '';
@@ -3490,7 +3764,7 @@ function endBusy() {
 /** サーバーの関数を呼ぶ。btn は押したボタン（くるくるを出す）。after はうまくいったときにすること */
 function call(fn, args, doneMsg, btn, after) {
   if (!window.google || !google.script) return;
-  const reading = fn === 'refreshFromWeb' || fn === 'addCompany' || (fn === 'resolveCandidate' && args[1]) || (fn === 'resolveDeadline' && args[1] === '提出済み');
+  const reading = fn === 'refreshFromWeb' || fn === 'addCompany' || (fn === 'resolveDeadline' && args[1] === '提出済み');
   const msg = fn === 'refreshFromWeb' ? 'メールを読んでいます' : reading ? '会社一覧に追加して、その会社のメールを読んでいます' : '保存しています';
   startBusy(msg, reading ? 'メールが多いと1〜2分かかることがあります。画面を閉じずにお待ちください。' : '', btn);
   google.script.run
@@ -3590,8 +3864,8 @@ function renderSettings() {
     });
   };
   group('会社（会社一覧に出さない・自動で入れない）', DATA.removed || [], x => x.name, 'restoreRemoved', x => x.name + ' を戻しました');
-  group('締切まとめ', DATA.hiddenDeadlines || [], x => x.name + '：' + (x.all ? '締切は全部' : x.label + ' ' + fmt(x.when)), 'restoreDeadline', x => x.name + ' の締切を戻しました');
-  group('日程未定', DATA.undecidedHidden || [], x => x.name + (x.label ? '：' + x.label : ''), 'unhideUndecided', x => x.name + ' を日程未定に戻しました');
+  group('一覧にない会社の締切', DATA.hiddenDeadlines || [], x => x.name + '：' + (x.all ? '締切は全部' : x.label + ' ' + fmt(x.when)), 'restoreDeadline', x => x.name + ' の締切を戻しました');
+  group('日時がまだの選考', DATA.undecidedHidden || [], x => x.name + (x.label ? '：' + x.label : ''), 'unhideUndecided', x => x.name + ' を戻しました');
   if (!rmBox.childNodes.length) rmBox.append(el('div', 'empty', 'ありません'));
 }
 $('settings-open').onclick = () => { $('add-co').hidden = true; $('settings').hidden = !$('settings').hidden; renderSettings(); };
@@ -3623,7 +3897,7 @@ $('import').onclick = () => $('import-file').click();
 $('import-file').onchange = () => {
   const f = $('import-file').files[0];
   $('import-file').value = '';
-  if (!f || !confirm(f.name + ' を読み込みますか？　今の会社一覧・タスク・締切まとめなどは、ファイルの中身で置きかわります')) return;
+  if (!f || !confirm(f.name + ' を読み込みますか？　今の会社一覧・やること・締切などは、ファイルの中身で置きかわります')) return;
   const reader = new FileReader();
   reader.onload = () => call('importAll', [String(reader.result)], '読み込みました。「メールから更新」で、メールを読み直してください', $('import'));
   reader.readAsText(f);
