@@ -394,8 +394,22 @@ function extractCompany(subject, from, body) {
   const label = body.match(/(?:^|\n)[ \t　]*(?:[(（]?\d+[)）][ \t　]*)?(?:受検|受験)企業名?[ \t　]*(?:[:：][ \t　]*|\n[ \t　]*)([^\n]{2,60})/);
   if (label && label[1].trim().length >= 2) return label[1].trim();
   if (inDomains(senderKey(from), TEST_CENTERS)) return senderKey(from);
+  // 差出人の名前がない採用システム（e2r.jp など）のメール：件名のかっこの中の会社名（「〜エントリー締切迫る!!(パナソニックグループ)」「【〇〇】」）
+  const tag = subjectCompany(subject);
+  if (tag) return tag;
   const m = body.slice(0, 500).match(re);
   return m ? trimRole(m[0]) : senderKey(from);
+}
+
+/** 件名の【】・（）の中で、会社名らしいもの（「締切」「重要」「28卒」などのお知らせの言葉ではないもの）。なければ空 */
+function subjectCompany(subject) {
+  const s = normalize(subject);
+  const tags = [...s.matchAll(/【([^】]{2,20})】|\(([^()]{2,20})\)|〈([^〈〉]{2,20})〉|<([^<>]{2,20})>/g)].map(m => (m[1] || m[2] || m[3] || m[4]).trim());
+  // （「日本航空」「日鉄物産」のように会社名に入る字は入れない。日付は数字で見分ける）
+  const notice = /締切|締め切|〆|期限|重要|再送|リマインド|必読|要確認|要返信|案内|お知らせ|選考|面接|予約|募集|開催|先着|限定|卒|[0-9]|!|受付|残り|最終|速報|new|web|オンライン|対面|説明会|セミナー|インターン|イベント|まで|迄|追加|変更|満席|無料|本日|明日|今週|当日/i;
+  const ok = tags.filter(t => !notice.test(t));
+  // 「〇〇グループ」「株式会社〇〇」「〇〇ホールディングス」を先に
+  return ok.find(t => /グループ|株式会社|有限会社|合同会社|ホールディングス|hd$/i.test(t)) || ok[0] || '';
 }
 
 /** メールがどの行の会社のものか（会社名・別名・ドメインで探す） */
@@ -2212,7 +2226,10 @@ function writeDeadlines(ss, found, submitted, now) {
     const key = candidateNameKey(f) + '|' + kindGroup(f.kind) + '|' + label;
     const o = old.get(key), prev = items.get(key);
     // 表の選考が終わった会社は、表と同じ名前。ほかは部署の名前を除いた会社名（「アクセンチュア 同志社大学リクルーターチーム」→「アクセンチュア」）
-    const name = lead.listName || f.listName || cleanCompanyName(shortName(lead.company)) || lead.sender;
+    const raw = lead.listName || f.listName || cleanCompanyName(shortName(lead.company)) || lead.sender;
+    // 会社名がわからず、採用システムの名前（e2r.jp など）しかないときは、件名（かっこの中を除いて短く）を見出しにする
+    const title = normalize(lead.subject).replace(/【[^】]*】|<[^>]*>|\([^)]*\)|〈[^〉]*〉|[!！]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 24);
+    const name = /\.[a-z]{2,}$/i.test(raw) && title ? title : raw;
     items.set(key, {
       key, company, name, label, when: f.when, subject: f.subject, url: f.url, sender: f.sender, kind: f.kind, alias: candidateAlias(f, name),
       mailAt: f.date.getTime(), firstAt: prev ? prev.firstAt : f.date.getTime(),

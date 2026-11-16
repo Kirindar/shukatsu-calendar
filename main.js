@@ -18,7 +18,7 @@ const ACTIONS = ['refreshFromWeb', 'resolveReview', 'resolveDeadline', 'addTask'
   'updateCompany', 'deleteCompany', 'setBlocked', 'addBlocked', 'removeBlocked', 'importAll', 'exportAll', 'removeAutoAdded', 'restoreRemoved',
   'hideUndecided', 'unhideUndecided', 'restoreDeadline'];
 const READ_ONLY = ['exportAll']; // ログインも保存もいらない
-const APP_VERSION = '20261116210259';          // アプリの版（build.ps1 が公開のたびに書きかえる。ログに出す）
+const APP_VERSION = '20261116212435';          // アプリの版（build.ps1 が公開のたびに書きかえる。ログに出す）
 const FIRST_DAYS = 7;              // 最初の更新で、まず読む日数（読めたら画面に出し、残りは裏で読む）
 const $ = id => document.getElementById(id);
 const ORIGINAL_COLLECT = window.collectMails;
