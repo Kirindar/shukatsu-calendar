@@ -226,6 +226,10 @@ function toStep(s) {
 const PASS_COLUMN = { 'ES': 'ES通過可否', 'Webテスト': 'webテスト通過可否', '動画選考': '動画選考通過可否', 'AI面接': 'AI面接通過可否', 'GD': 'GD合否',
   '1次面接': '一次面接合否', '2次面接': '二次面接合否', '3次面接': '三次面接合否', '最終面接': '最終面接合否' };
 const NEXT_AFTER_PASS = { '1次面接': '2次面接', '2次面接': '3次面接', '3次面接': '4次面接', '1次選考': '2次選考', '2次選考': '3次選考', '3次選考': '4次選考' };
+// 通過したあとの次の選考の見当（手で「通過した」を押したとき、最初から選んでおく）
+const nextGuess = s => NEXT_AFTER_PASS[s] || { 'ES': 'Webテスト', 'Webテスト': '1次面接', '動画選考': '1次面接', 'AI面接': '1次面接', 'GD': '1次面接', '面接': '2次面接', '4次面接': '最終面接', '4次選考': '最終面接' }[s] || '';
+// 会社が1つだけ出せばいい、やること（リマインドが何通来ても1つ）：面談・座談会の予約、マイページで結果を確認
+const SINGLE_TASK = /の予約$|^マイページで結果を確認$/;
 
 /** 前の選考状況シートの行を、新しい表の行の形にする */
 function migrateRows() {
@@ -869,6 +873,15 @@ function splitTitle(title) {
   const t = normalize(title).trim();
   const m = t.match(/^(\S*(?:株式会社|有限会社|合同会社)\S*|(?:株式会社|有限会社|合同会社)\s*\S+)\s*(.*)$/) || t.match(/^(\S+)\s+(.*)$/);
   return m ? { company: m[1], what: m[2] } : { company: t, what: '' };
+}
+
+/** 選考の結果をマイページで見るように、というメールか（日本航空の「レターボックス」、アクセンチュアの「Letter Box」など。合否は書いていない） */
+function mypageResult(d) {
+  const subject = normalize(d.subject), head = normalize(stripQuote(d.body)).slice(0, 800);
+  if (!/結果|合否/.test(subject) || BROADCAST_SUBJECT.test(subject)) return false;
+  if (resultOf(subject, head) || STRONG_PASS.test(subject + '\n' + head)) return false; // メールに合否が書いてある
+  if (/次の(ステップ|選考|段階)は|次回(の)?(選考|面接)は/.test(head)) return false; // 次の選考が書いてある（通過の連絡。アビーム）
+  return /マイページ|my\s*page|レターボックス|letter\s*box|メッセージボックス|メッセージ\s*box/i.test(head) && /確認|ご覧|アクセス|ログイン|届いて/.test(head);
 }
 
 /** 日程調整ツールのメールを、決まった場所から読む */
@@ -1635,7 +1648,7 @@ function applyTasks(ss, table, found, receipts, myMails, now) {
   const trace = [];
   // 前の版で、同じ会社の同じ予約（座談会の予約など）がいくつも入っていたら、いちばん新しいメールのものだけ残す
   const seenBooking = new Map();
-  list.filter(x => !x.done && !(x.tool || {}).manual && /の予約$/.test((x.tool || {}).item || '')).sort((a, b) => (b.tool.at || 0) - (a.tool.at || 0)).forEach(x => {
+  list.filter(x => !x.done && !(x.tool || {}).manual && SINGLE_TASK.test((x.tool || {}).item || '')).sort((a, b) => (b.tool.at || 0) - (a.tool.at || 0)).forEach(x => {
     const k = x.tool.row + '|' + x.tool.item;
     if (!seenBooking.has(k)) { seenBooking.set(k, x); return; }
     list.splice(list.indexOf(x), 1);
@@ -1668,7 +1681,7 @@ function applyTasks(ss, table, found, receipts, myMails, now) {
     }
     // 面談・座談会などの予約：リマインドのメールが何通来ても、同じ会社の同じ予約は1つ（新しいメールの締切・リンクにする）。
     //  前の版はメールのスレッドごとに足していたので、日鉄物産の「座談会の予約」が3つになった
-    if (/の予約$/.test(f.item || '')) {
+    if (SINGLE_TASK.test(f.item || '')) {
       const same = list.filter(x => !(x.tool || {}).manual && (x.tool || {}).row === rowKey(row) && (x.tool || {}).item === f.item);
       const open = same.find(x => !x.done);
       if (open) {
@@ -1702,6 +1715,12 @@ function applyTasks(ss, table, found, receipts, myMails, now) {
     // 予定（面談など）は、終わったら自動で済
     if (t.appt) {
       if ((t.end || (x.due ? x.due.getTime() : 0)) < now.getTime()) { x.done = true; changed++; }
+      continue;
+    }
+    // マイページで結果を確認：そのあとに会社一覧の行が進んだら（通過・NGのメール、手で「通過した」など）済
+    if (t.item === 'マイページで結果を確認') {
+      const r = rowByKey.get(t.row);
+      if (!r || (r.owned && (r.owned.at || 0) > (t.at || 0))) { x.done = true; t.autoDone = '結果がわかった'; changed++; }
       continue;
     }
     // 面談などの予約（「面談の予約」）：その会社の面談などの日時が、頼まれたあとに決まったら済
@@ -1773,6 +1792,71 @@ function skipDeadline(key, decline) {
   const owned = Object.assign({}, row.owned || {}, decline ? { state: '辞退', endedAt: now } : { dismissed: row.when ? row.when.getTime() : now });
   if (decline) table.sheet.getRange(row.r, table.cols.state).setValue('辞退');
   table.sheet.getRange(row.r, table.cols.owned).setValue(JSON.stringify(owned));
+  return getData();
+}
+
+/**
+ * 手で選考を進める（メールが来ない選考のため）。行の状況・次の選考・日時を書き、選考の流れにも「手で入れた」出来事として残す
+ * （予定の記録・通過率に入る）。ツールが書いたものとして覚えるので、あとでもっと新しいメールが来たら、メールの内容で進む。
+ *   action：'pass'（通過した。opts.step 次の選考・opts.when 日時か期限・opts.slot 日程か締切）／'ng'／'offer'（内定・参加決定）／
+ *           'schedule'（今の次の選考の日時・期限が決まった。opts.when・opts.slot）
+ *   taskKey：「マイページで結果を確認」のやることから押したときは、そのやることも済にする
+ */
+function advanceCompany(key, action, opts, taskKey) {
+  const ss = getSpreadsheet();
+  const table = readTable(ss);
+  const row = findRow(table, key);
+  const now = new Date();
+  const o = opts || {};
+  const when = o.when ? new Date(o.when) : null;
+  if (when && isNaN(when.getTime())) throw new Error('日時の形がおかしいです');
+  const kind = kindGroup(row.kind);
+  const owned0 = row.owned || {};
+  const events = [];
+  const ev = (type, step, at, extra) => events.push(Object.assign({ id: 'manual:' + now.getTime() + ':' + events.length + '|' + type, name: row.name, kind,
+    date: at, type, step: step || '', when: 0, state: '', mail: '', flags: 'manual' }, extra || {}));
+  // 通過・NG・内定の前に、終わった段階（結果待ちの面接・提出したES）を流れに入れておく（記録に残り、結果が付く）
+  const finished = () => {
+    if (row.step !== WAITING || !owned0.done || !owned0.at) return;
+    if (SUBMIT_STEPS.includes(owned0.done)) ev('提出済', owned0.done, owned0.at);
+    else ev('予定', owned0.done, owned0.at, { when: owned0.at });
+  };
+  const put = (k, v) => { if (table.cols[k]) table.sheet.getRange(row.r, table.cols[k]).setValue(v); };
+  let owned;
+  if (action === 'pass') {
+    const step = STEP_LIST.includes(o.step) && o.step !== WAITING ? o.step : '';
+    if (!step) throw new Error('次の選考を選んでください');
+    const slot = when ? (SLOT_LIST.includes(o.slot) ? o.slot : defaultSlot(step)) : '';
+    finished();
+    ev('通過', step, now.getTime());
+    if (when) ev(slot === DEADLINE ? '締切' : '予定', step, now.getTime() + 1, { when: when.getTime() });
+    put('step', step); put('slot', slot); put('when', when || ''); put('state', '選考中');
+    owned = { step, slot, when: when ? when.getTime() : null, at: now.getTime() };
+  } else if (action === 'ng' || action === 'offer') {
+    const state = action === 'ng' ? 'NG' : kind === 'インターン' ? 'インターン参加決定' : '内定';
+    finished();
+    ev('結果', '', now.getTime(), { state });
+    put('state', state);
+    owned = Object.assign({}, owned0, { state, at: now.getTime(), endedAt: now.getTime() });
+  } else if (action === 'schedule') {
+    if (!when) throw new Error('日時を入れてください');
+    const slot = SLOT_LIST.includes(o.slot) ? o.slot : defaultSlot(row.step);
+    ev(slot === DEADLINE ? '締切' : '予定', row.step, now.getTime(), { when: when.getTime() });
+    put('slot', slot); put('when', when);
+    owned = { step: row.step, slot, when: when.getTime(), at: now.getTime() };
+  } else {
+    throw new Error('わからない操作です：' + action);
+  }
+  put('owned', JSON.stringify(owned));
+  // 選考の流れに足して、予定の記録（過ぎた選考とその結果）を作り直す
+  const { sheet, list } = readFlow(ss);
+  saveFlow(sheet, list.concat(events));
+  writeHistory(ss, readTable(ss), list.concat(events), now);
+  if (taskKey) {
+    const t = readTasks(ss);
+    const x = t.list.find(y => y.key === taskKey);
+    if (x) { x.done = true; writeTasks(t.sheet, t.list); }
+  }
   return getData();
 }
 
@@ -2640,6 +2724,11 @@ function update(full) {
     // 面談などの予約の締切：表にある会社はタスク「面談の予約」（表にない会社は締切まとめ：applyFindings）
     if (f && f.meeting) tasks.push(Object.assign({}, f, { item: f.what, due: f.when, rel: '', days: 0, thread: d.thread, detail: '' }));
     tasksOf(d).forEach(t => tasks.push(t));
+    // 「選考結果をマイページでご確認ください」（合否はメールに書いていない）：やることに「マイページで結果を確認」（通過した・NGだったのボタン付き）
+    if (!(f && f.type === '結果') && mypageResult(d)) {
+      tasks.push({ ...mailInfo(d), item: 'マイページで結果を確認', what: 'マイページで結果を確認', due: null, rel: '', days: 0, thread: d.thread,
+        detail: 'マイページで選考結果を確認（通過した・NGだったを押すと、会社一覧も進みます）' });
+    }
     receiptsOf(d).forEach(r => receipts.push(r));
   }
   // 前に読んだ出来事（選考の流れ）：メールが古くなって消えても、選考が終わった日・エントリーの締切などがわかる
@@ -2701,6 +2790,7 @@ function getData() {
   const item = r => ({ key: rowKey(r), name: r.name, kind: r.kind, state: r.state, step: r.step, slot: r.slot, label: stepLabel(r.step, r.slot),
     autoKey: autoKeyOf(r),
     waitFor: r.step === WAITING && r.owned && r.owned.done || '',
+    nextGuess: r.step === WAITING && r.owned && r.owned.done ? nextGuess(r.owned.done) : '',
     // 結果待ちになってからの日数（ツールが結果待ちにした行だけ。自分で書いた結果待ちは、いつからかわからない）
     waitDays: r.step === WAITING && r.owned && r.owned.step === WAITING && r.owned.at ? Math.round((today.getTime() - new Date(new Date(r.owned.at).setHours(0, 0, 0, 0)).getTime()) / 864e5) : null,
     // 締切が過ぎたまま（提出した・しなかったが、わからない）：会社タブに出す
@@ -2776,7 +2866,7 @@ function getData() {
   const tasks = allTasks.filter(x => !(x.tool || {}).appt)
     .sort((a, b) => (a.due ? a.due.getTime() : Infinity) - (b.due ? b.due.getTime() : Infinity))
     // hold：面接のあとにやること で、面接がまだ始まっていないもの（一覧には出さず、カレンダーの面接の日にだけ出す）
-    .map(x => { const t = x.tool || {}; return { key: x.key, name: x.name, what: x.what, when: x.due ? x.due.toISOString() : null, rel: t.rel || '', mail: x.mail, manual: !!t.manual, detail: x.detail || '',
+    .map(x => { const t = x.tool || {}; return { key: x.key, name: x.name, what: x.what, item: t.item || '', row: t.row || '', when: x.due ? x.due.toISOString() : null, rel: t.rel || '', mail: x.mail, manual: !!t.manual, detail: x.detail || '',
       hold: t.rel === 'after' && (!t.showFrom || t.showFrom > now.getTime()) }; });
   // 予定の重なり：これからの面接・GDなど（日程）と面談で、時間がかぶるか、間が CONFLICT_GAP_MIN 分より短いもの（同じ会社どうしは見ない）。
   // 長さがわからない予定は1時間とみる。重なった予定には、相手の会社名を clash に入れる
@@ -2974,6 +3064,9 @@ const PAGE_HTML = String.raw`<!DOCTYPE html>
   /* 締切まとめ（表にない会社の締切）：表の会社の締切より控えめに、点線の枠 */
   .chip.dl2 { background: transparent; color: var(--red); border: 1px dashed var(--red); }
   /* やること・待っているタブの中の区切り（確認してほしいこと／自分がやること／一覧にない会社の締切 など） */
+  /* 手で進めるときの入力（通過した → 次の選考・日時） */
+  .adv-form label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 0; }
+  .adv-form select, .adv-form input { display: block; width: 100%; margin-top: 3px; font-size: 14px; }
   /* 期限切れの行：ボタン（済・出さなかった・メール）は行の下に */
   .item.wrap { flex-wrap: wrap; }
   .item .acts { flex-basis: 100%; display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
@@ -3292,6 +3385,12 @@ function taskRow(x) {
   const done = el('button', null, '済');
   done.onclick = () => call('doneTask', [x.key], '済にしました', done);
   if (x.mail) { const a = el('a', 'btn', 'メール'); a.href = x.mail; a.target = '_blank'; a.rel = 'noopener'; it.append(a); }
+  // マイページで結果を確認：「通過した」「NGだった」で、その会社の行を進めて、このやることも済にする
+  if (x.item === 'マイページで結果を確認' && x.row) {
+    const co = (DATA.companiesAll || []).find(c => c.key === x.row);
+    const btns = co ? advButtons(Object.assign({}, co, co.step === '結果待ち' ? {} : { step: '結果待ち', nextGuess: co.nextGuess || '' }), x.key) : [];
+    if (btns.length) return withActs(it, btns.concat([done]));
+  }
   // 期限切れ：「出さなかった」でも片づけられる（やることから外す）。ボタンは行の下に
   if (x.when && new Date(x.when).getTime() < Date.now() && !x.appt) {
     const skip = el('button', null, '出さなかった');
@@ -3380,6 +3479,69 @@ function overdueRow(x) {
     call('skipDeadline', [x.key, decline], decline ? x.name + 'を辞退にしました' : 'やることから外しました', skip);
   };
   return withActs(it, [done, skip]);
+}
+
+// ----- 手で選考を進める（メールが来ない選考のため）：行の今の状態に合わせて、起こりそうなことのボタンを出す -----
+
+/** 会社一覧の行（x）に出すボタン：結果待ちなら「通過した」「NGだった」、日時がまだなら「日程が決まった」。taskKey はやることから押したとき */
+function advButtons(x, taskKey) {
+  if (!x || !x.key || ['内定', 'インターン参加決定', 'NG', '辞退'].includes(x.state)) return [];
+  const b = (label, fn) => { const e = el('button', 'adv', label); e.onclick = ev => { ev.stopPropagation(); fn(e); }; return e; };
+  if (x.step === '結果待ち') {
+    return [b('通過した', e => openAdvance(x, 'pass', taskKey, e)),
+      b('NGだった', e => { if (confirm(x.name + ' を「NG」にしますか？')) { hidePop(); call('advanceCompany', [x.key, 'ng', {}, taskKey || ''], x.name + 'をNGにしました', e); } })]
+      // 最終面接（インターンの選考なら最後の面接）の結果待ちには「内定」（インターンは「参加決定」）も
+      .concat(/最終/.test(x.waitFor || '') ? [b(/インターン/.test(x.kind || '') ? '参加決定' : '内定', e => { hidePop(); call('advanceCompany', [x.key, 'offer', {}, taskKey || ''], x.name + 'を' + (/インターン/.test(x.kind || '') ? 'インターン参加決定' : '内定') + 'にしました', e); })] : []);
+  }
+  if (x.step && !x.when) return [b('日程が決まった', e => openAdvance(x, 'schedule', taskKey, e))];
+  return [];
+}
+
+/** 「通過した」「日程が決まった」の入力（くわしい画面の場所に出す）：次の選考（見当を最初に選んでおく）と、わかれば日時・期限 */
+function openAdvance(x, mode, taskKey, anchor) {
+  const pop = $('pop');
+  pop.replaceChildren();
+  const close = el('button', 'close', '×');
+  close.setAttribute('aria-label', '閉じる');
+  close.onclick = hidePop;
+  const form = el('div', 'adv-form');
+  const stepSel = el('select');
+  stepSel.setAttribute('aria-label', '次の選考');
+  (DATA.choices.steps || []).filter(s => s !== '結果待ち' && s !== 'その他').forEach(s => { const o = el('option', null, s); o.value = s; stepSel.append(o); });
+  stepSel.value = mode === 'pass' ? (x.nextGuess || '面接') : x.step;
+  stepSel.disabled = mode !== 'pass';
+  const whenIn = el('input'); whenIn.type = 'datetime-local'; whenIn.setAttribute('aria-label', '日時・期限');
+  const slotSel = el('select'); slotSel.setAttribute('aria-label', '日程か締切か');
+  [['日程', '日程（その日時に受ける）'], ['締切', '締切（その日時までに出す・受ける）']].forEach(([v, l]) => { const o = el('option', null, l); o.value = v; slotSel.append(o); });
+  const fitSlot = () => { slotSel.value = ['ES', 'Webテスト', '動画選考', 'AI面接'].includes(stepSel.value) ? '締切' : '日程'; };
+  fitSlot();
+  stepSel.onchange = fitSlot;
+  const lab = (t, input) => { const l = el('label', null, t); l.append(input); return l; };
+  if (mode === 'pass') form.append(lab('次の選考', stepSel));
+  form.append(lab(mode === 'pass' ? '日時・期限（わかれば）' : '日時・期限', whenIn), lab('種類', slotSel));
+  const ok = el('button', 'primary', '保存');
+  ok.onclick = () => {
+    if (mode === 'schedule' && !whenIn.value) { toast('日時を入れてください', true); return; }
+    const opts = { step: stepSel.value, when: whenIn.value ? new Date(whenIn.value).toISOString() : '', slot: slotSel.value };
+    hidePop();
+    call('advanceCompany', [x.key, mode, opts, taskKey || ''], mode === 'pass' ? x.name + 'を「' + opts.step + '」に進めました' : x.name + 'の日程を入れました', ok);
+  };
+  const cancel = el('button', null, 'やめる');
+  cancel.onclick = hidePop;
+  const actions = el('div', 'actions');
+  actions.append(ok, cancel);
+  pop.append(close, el('h3', null, x.name), el('div', 'what', mode === 'pass' ? (x.waitFor ? x.waitFor + 'を' : '') + '通過した' : (x.label || x.step) + 'の日程が決まった'), form, actions);
+  pop.hidden = false;
+  const r = (anchor || document.body).getBoundingClientRect();
+  const w = pop.offsetWidth, h = pop.offsetHeight;
+  pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+  pop.style.top = (r.bottom + h + 8 > window.innerHeight ? Math.max(8, r.top - h - 6) : r.bottom + 6) + 'px';
+}
+
+/** 行に、手で進めるボタンがあれば付ける（行の下に） */
+function withAdv(it, x) {
+  const btns = advButtons(x);
+  return btns.length ? withActs(it, btns) : it;
 }
 
 /** ボタンが多い行（期限切れ）：ボタンとメールを行の下にまとめる（会社名がつぶれないように） */
@@ -3510,7 +3672,7 @@ function render() {
     .concat(DATA.undecided.filter(x => x.slot === '日程調整').map(x => Object.assign({ adjust: true }, x, { label: x.step + 'の予約（日程を決める）' })))
     .sort(byWhen);
   const td = $('todo-list'); td.replaceChildren();
-  todo.forEach(x => td.append(x.task ? taskRow(x) : x.adjust ? withHide(row(x, false), x) : x.overdue ? overdueRow(x) : row(x, !!x.when)));
+  todo.forEach(x => td.append(x.task ? taskRow(x) : x.adjust ? withAdv(withHide(row(x, false), x), x) : x.overdue ? overdueRow(x) : row(x, !!x.when)));
   if (!todo.length) td.append(el('div', 'empty', 'ありません'));
   // 予定（その日時に参加する）：面接・GDなどの日程と、面談など
   const plans = DATA.upcoming.filter(x => x.slot !== '締切').concat(DATA.appts || []).sort(byWhen);
@@ -3521,7 +3683,7 @@ function render() {
   // 隠した会社は下の「非表示にした会社」に出して、「戻す」で戻せる（日程を決める番の会社は「やること」に出る）
   const un = $('undecided'); un.replaceChildren();
   const waitDate = DATA.undecided.filter(x => x.slot !== '日程調整');
-  waitDate.forEach(x => un.append(withHide(row(x, false), x)));
+  waitDate.forEach(x => un.append(withAdv(withHide(row(x, false), x), x)));
   const hid = DATA.undecidedHidden || [];
   if (!waitDate.length) un.append(el('div', 'empty', hid.length ? 'ありません（ほかは非表示にした会社です）' : 'ありません'));
   if (hid.length) {
@@ -3541,7 +3703,7 @@ function render() {
     un.append(det);
   }
   const wt = $('waiting-list'); wt.replaceChildren();
-  (DATA.waiting || []).forEach(x => wt.append(row(x, false)));
+  (DATA.waiting || []).forEach(x => wt.append(withAdv(row(x, false), x)));
   if (!(DATA.waiting || []).length) wt.append(el('div', 'empty', 'ありません'));
 
   // 締切まとめ：7日以内と、それより先に分けて、近い順
@@ -3762,7 +3924,8 @@ function showPop(x, anchor) {
     done.onclick = () => { hidePop(); call('doneTask', [x.key], '済にしました', done); };
     actions.append(done);
   }
-  // 表の会社の行なら「編集」（状況・次の選考・日時・メモなどを直す）
+  // 表の会社の行なら、手で進めるボタン（通過した・NGだった・日程が決まった）と「編集」（状況・次の選考・日時・メモなどを直す）
+  if (!x.task && !x.appt && !x.ext && !x.hist && x.key) advButtons(x).forEach(b => actions.append(b));
   if (!x.task && !x.appt && !x.ext && x.key) {
     const edit = el('button', null, '編集');
     edit.onclick = () => { hidePop(); openAddCompany(x); };
